@@ -29,3 +29,5 @@ glad.zip
 
 vgcore.*
 
+# Windows host app build output
+/windows/build/
