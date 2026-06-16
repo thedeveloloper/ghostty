@@ -1,15 +1,19 @@
 // Minimal native Windows host for Ghostty.
 //
 // This embeds libghostty through its C API (include/ghostty.h), the same way
-// the macOS app embeds it through Swift. It is a proof of concept: it opens a
-// single window, creates a terminal surface bound to the window's HWND, drives
-// the libghostty event loop, and feeds basic keyboard input. The Direct3D 11
-// renderer inside libghostty draws into the HWND.
+// the macOS app embeds it through Swift. It opens a single window, creates a
+// terminal surface bound to the window's HWND, drives the libghostty event
+// loop, and translates Win32 keyboard/mouse/clipboard events into the core's
+// input API. The Direct3D 11 renderer inside libghostty draws into the HWND.
 //
-// Richer input, tabs/splits, native chrome, and settings are intentionally out
-// of scope here; this exists to prove the embedding + render path end to end.
+// Out of scope for now: tabs/splits, native chrome, settings, and full IME
+// composition (basic typing works via ToUnicode; IME preedit is a follow-up).
 
 #include <windows.h>
+#include <windowsx.h>
+
+#include <cstring>
+#include <string>
 
 #include "ghostty.h"
 
@@ -31,6 +35,38 @@ constexpr UINT WM_GHOSTTY_WAKEUP = WM_USER + 1;
 double dpiScale(HWND hwnd) {
     const UINT dpi = GetDpiForWindow(hwnd);
     return (dpi == 0 ? 96.0 : static_cast<double>(dpi)) / 96.0;
+}
+
+// Current keyboard modifier state as a ghostty mods mask.
+ghostty_input_mods_e currentMods() {
+    int mods = GHOSTTY_MODS_NONE;
+    if (GetKeyState(VK_SHIFT) & 0x8000)
+        mods |= GHOSTTY_MODS_SHIFT;
+    if (GetKeyState(VK_CONTROL) & 0x8000)
+        mods |= GHOSTTY_MODS_CTRL;
+    if (GetKeyState(VK_MENU) & 0x8000)
+        mods |= GHOSTTY_MODS_ALT;
+    if ((GetKeyState(VK_LWIN) | GetKeyState(VK_RWIN)) & 0x8000)
+        mods |= GHOSTTY_MODS_SUPER;
+    if (GetKeyState(VK_CAPITAL) & 0x0001)
+        mods |= GHOSTTY_MODS_CAPS;
+    if (GetKeyState(VK_NUMLOCK) & 0x0001)
+        mods |= GHOSTTY_MODS_NUM;
+    if (GetKeyState(VK_RSHIFT) & 0x8000)
+        mods |= GHOSTTY_MODS_SHIFT_RIGHT;
+    if (GetKeyState(VK_RCONTROL) & 0x8000)
+        mods |= GHOSTTY_MODS_CTRL_RIGHT;
+    if (GetKeyState(VK_RMENU) & 0x8000)
+        mods |= GHOSTTY_MODS_ALT_RIGHT;
+    return static_cast<ghostty_input_mods_e>(mods);
+}
+
+// The Windows scan code, which is what the core's keycode table is keyed on
+// (Chromium's "win" column). Extended keys get the 0xE000 prefix.
+uint32_t scancodeFromLParam(LPARAM lparam) {
+    const uint32_t sc = static_cast<uint32_t>((lparam >> 16) & 0xFF);
+    const bool extended = (lparam & (1 << 24)) != 0;
+    return extended ? (0xE000u | sc) : sc;
 }
 
 //----------------------------------------------------------------------------//
@@ -73,13 +109,33 @@ bool actionCb(ghostty_app_t app, ghostty_target_s target, ghostty_action_s actio
     }
 }
 
-// Clipboard is not yet implemented (Phase 4). Reads fail gracefully and writes
-// are dropped.
+// Read the standard clipboard as UTF-8 and hand it back to the core.
 bool readClipboardCb(void* userdata, ghostty_clipboard_e location, void* state) {
-    (void)userdata;
     (void)location;
-    (void)state;
-    return false;
+    auto* host = static_cast<Host*>(userdata);
+    if (host == nullptr || host->surface == nullptr)
+        return false;
+
+    std::string utf8;
+    if (OpenClipboard(host->hwnd)) {
+        HANDLE handle = GetClipboardData(CF_UNICODETEXT);
+        if (handle != nullptr) {
+            const wchar_t* wide = static_cast<const wchar_t*>(GlobalLock(handle));
+            if (wide != nullptr) {
+                const int n =
+                    WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+                if (n > 0) {
+                    utf8.resize(static_cast<size_t>(n));
+                    WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8.data(), n, nullptr, nullptr);
+                }
+                GlobalUnlock(handle);
+            }
+        }
+        CloseClipboard();
+    }
+
+    ghostty_surface_complete_clipboard_request(host->surface, utf8.c_str(), state, true);
+    return true;
 }
 
 void confirmReadClipboardCb(void* userdata, const char* str, void* state,
@@ -90,13 +146,41 @@ void confirmReadClipboardCb(void* userdata, const char* str, void* state,
     (void)request;
 }
 
+// Write the first text content to the standard clipboard as UTF-16.
 void writeClipboardCb(void* userdata, ghostty_clipboard_e location,
                       const ghostty_clipboard_content_s* content, size_t len, bool confirm) {
-    (void)userdata;
     (void)location;
-    (void)content;
-    (void)len;
     (void)confirm;
+    auto* host = static_cast<Host*>(userdata);
+    if (host == nullptr || content == nullptr || len == 0)
+        return;
+
+    const char* text = nullptr;
+    for (size_t i = 0; i < len; i++) {
+        if (content[i].mime != nullptr && std::strcmp(content[i].mime, "text/plain") == 0) {
+            text = content[i].data;
+            break;
+        }
+    }
+    if (text == nullptr)
+        text = content[0].data;
+    if (text == nullptr)
+        return;
+
+    const int wn = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
+    if (wn <= 0)
+        return;
+    if (!OpenClipboard(host->hwnd))
+        return;
+    EmptyClipboard();
+    HGLOBAL global = GlobalAlloc(GMEM_MOVEABLE, static_cast<size_t>(wn) * sizeof(wchar_t));
+    if (global != nullptr) {
+        auto* wide = static_cast<wchar_t*>(GlobalLock(global));
+        MultiByteToWideChar(CP_UTF8, 0, text, -1, wide, wn);
+        GlobalUnlock(global);
+        SetClipboardData(CF_UNICODETEXT, global);
+    }
+    CloseClipboard();
 }
 
 void closeSurfaceCb(void* userdata, bool process_alive) {
@@ -109,16 +193,56 @@ void closeSurfaceCb(void* userdata, bool process_alive) {
 // Input
 //----------------------------------------------------------------------------//
 
-// Feed typed UTF-16 text (from WM_CHAR, including Enter as \r) to the surface
-// as terminal input. This is the minimal path; proper key-event translation
-// (modifiers, key bindings, IME) is Phase 4.
-void feedText(Host* host, wchar_t ch) {
+void handleKey(Host* host, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (host->surface == nullptr)
         return;
-    char utf8[8];
-    const int n = WideCharToMultiByte(CP_UTF8, 0, &ch, 1, utf8, sizeof(utf8), nullptr, nullptr);
-    if (n > 0)
-        ghostty_surface_text(host->surface, utf8, static_cast<uintptr_t>(n));
+
+    const bool down = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
+    const bool repeat = down && (lparam & (1 << 30)) != 0;
+
+    ghostty_input_key_s ev = {};
+    ev.action =
+        down ? (repeat ? GHOSTTY_ACTION_REPEAT : GHOSTTY_ACTION_PRESS) : GHOSTTY_ACTION_RELEASE;
+    ev.mods = currentMods();
+    ev.consumed_mods = GHOSTTY_MODS_NONE;
+    ev.keycode = scancodeFromLParam(lparam);
+    ev.composing = false;
+
+    // Translate the key to its produced text (Enter -> \r, etc.). Only on key
+    // down; ToUnicode also advances dead-key state.
+    char utf8[16] = {0};
+    if (down) {
+        BYTE kb[256];
+        if (GetKeyboardState(kb)) {
+            WCHAR wide[8];
+            const int n = ToUnicode(static_cast<UINT>(wparam),
+                                    static_cast<UINT>((lparam >> 16) & 0xFF), kb, wide, 8, 0);
+            if (n > 0) {
+                WideCharToMultiByte(CP_UTF8, 0, wide, n, utf8, sizeof(utf8) - 1, nullptr, nullptr);
+            }
+        }
+    }
+    ev.text = utf8;
+
+    // Unshifted codepoint, used for keybinding matching.
+    uint32_t cp = MapVirtualKeyW(static_cast<UINT>(wparam), MAPVK_VK_TO_CHAR) & 0x7FFFFFFFu;
+    if (cp >= 'A' && cp <= 'Z')
+        cp += 32;
+    ev.unshifted_codepoint = cp;
+
+    ghostty_surface_key(host->surface, ev);
+}
+
+void handleMouseButton(Host* host, ghostty_input_mouse_state_e state,
+                       ghostty_input_mouse_button_e button) {
+    if (host->surface == nullptr)
+        return;
+    if (state == GHOSTTY_MOUSE_PRESS) {
+        SetCapture(host->hwnd);
+    } else {
+        ReleaseCapture();
+    }
+    ghostty_surface_mouse_button(host->surface, state, button, currentMods());
 }
 
 LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -165,8 +289,51 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             ghostty_surface_set_focus(host->surface, false);
         return 0;
 
-    case WM_CHAR:
-        feedText(host, static_cast<wchar_t>(wparam));
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+        handleKey(host, msg, wparam, lparam);
+        return 0;
+
+    case WM_MOUSEMOVE:
+        if (host->surface != nullptr) {
+            ghostty_surface_mouse_pos(host->surface, static_cast<double>(GET_X_LPARAM(lparam)),
+                                      static_cast<double>(GET_Y_LPARAM(lparam)), currentMods());
+        }
+        return 0;
+
+    case WM_LBUTTONDOWN:
+        handleMouseButton(host, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT);
+        return 0;
+    case WM_LBUTTONUP:
+        handleMouseButton(host, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT);
+        return 0;
+    case WM_RBUTTONDOWN:
+        handleMouseButton(host, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_RIGHT);
+        return 0;
+    case WM_RBUTTONUP:
+        handleMouseButton(host, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_RIGHT);
+        return 0;
+    case WM_MBUTTONDOWN:
+        handleMouseButton(host, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_MIDDLE);
+        return 0;
+    case WM_MBUTTONUP:
+        handleMouseButton(host, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_MIDDLE);
+        return 0;
+
+    case WM_MOUSEWHEEL:
+        if (host->surface != nullptr) {
+            const double delta = static_cast<double>(GET_WHEEL_DELTA_WPARAM(wparam)) / WHEEL_DELTA;
+            ghostty_surface_mouse_scroll(host->surface, 0.0, delta, 0);
+        }
+        return 0;
+
+    case WM_MOUSEHWHEEL:
+        if (host->surface != nullptr) {
+            const double delta = static_cast<double>(GET_WHEEL_DELTA_WPARAM(wparam)) / WHEEL_DELTA;
+            ghostty_surface_mouse_scroll(host->surface, delta, 0.0, 0);
+        }
         return 0;
 
     case WM_CLOSE:
