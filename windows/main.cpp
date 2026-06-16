@@ -12,7 +12,10 @@
 
 #include <windows.h>
 #include <windowsx.h>
+// dbghelp.h must follow windows.h.
+#include <dbghelp.h>
 
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -1048,9 +1051,83 @@ LRESULT CALLBACK appWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
+// Unhandled-exception handler: write a symbolized backtrace of the crashing
+// thread to ghostty-crash.txt next to the exe, so crashes can be diagnosed
+// without a debugger. Symbols resolve from the .pdb the Debug build emits.
+LONG WINAPI crashHandler(EXCEPTION_POINTERS* ep) {
+    HANDLE process = GetCurrentProcess();
+    HANDLE thread = GetCurrentThread();
+    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+    SymInitialize(process, nullptr, TRUE);
+
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring out(exe);
+    out = out.substr(0, out.find_last_of(L"\\/") + 1) + L"ghostty-crash.txt";
+    FILE* f = _wfopen(out.c_str(), L"w");
+    if (f == nullptr)
+        return EXCEPTION_EXECUTE_HANDLER;
+
+    fprintf(f, "Unhandled exception 0x%08lX at %p\n\n", ep->ExceptionRecord->ExceptionCode,
+            ep->ExceptionRecord->ExceptionAddress);
+
+    CONTEXT context = *ep->ContextRecord;
+    STACKFRAME64 frame = {};
+    frame.AddrPC.Offset = context.Rip;
+    frame.AddrPC.Mode = AddrModeFlat;
+    frame.AddrFrame.Offset = context.Rbp;
+    frame.AddrFrame.Mode = AddrModeFlat;
+    frame.AddrStack.Offset = context.Rsp;
+    frame.AddrStack.Mode = AddrModeFlat;
+
+    char symbuf[sizeof(SYMBOL_INFO) + 512] = {};
+    auto* sym = reinterpret_cast<SYMBOL_INFO*>(symbuf);
+
+    for (int i = 0; i < 64; i++) {
+        if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, process, thread, &frame, &context, nullptr,
+                         SymFunctionTableAccess64, SymGetModuleBase64, nullptr))
+            break;
+        if (frame.AddrPC.Offset == 0)
+            break;
+
+        const DWORD64 base = SymGetModuleBase64(process, frame.AddrPC.Offset);
+        char module[64] = "?";
+        if (base != 0) {
+            IMAGEHLP_MODULE64 mi = {};
+            mi.SizeOfStruct = sizeof(mi);
+            if (SymGetModuleInfo64(process, base, &mi)) {
+                strncpy(module, mi.ModuleName, sizeof(module) - 1);
+            }
+        }
+
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 511;
+        DWORD64 disp = 0;
+        if (SymFromAddr(process, frame.AddrPC.Offset, &disp, sym)) {
+            IMAGEHLP_LINE64 line = {};
+            line.SizeOfStruct = sizeof(line);
+            DWORD line_disp = 0;
+            if (SymGetLineFromAddr64(process, frame.AddrPC.Offset, &line_disp, &line)) {
+                fprintf(f, "%2d  %s!%s + 0x%llx  (%s:%lu)\n", i, module, sym->Name, disp,
+                        line.FileName, line.LineNumber);
+            } else {
+                fprintf(f, "%2d  %s!%s + 0x%llx\n", i, module, sym->Name, disp);
+            }
+        } else {
+            fprintf(f, "%2d  %s + 0x%llx\n", i, module, frame.AddrPC.Offset - base);
+        }
+    }
+
+    fclose(f);
+    MessageBoxW(nullptr, L"Ghostty crashed. A backtrace was written to ghostty-crash.txt.",
+                L"Ghostty crash", MB_ICONERROR);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
+    SetUnhandledExceptionFilter(crashHandler);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     if (ghostty_init(0, nullptr) != 0) {
