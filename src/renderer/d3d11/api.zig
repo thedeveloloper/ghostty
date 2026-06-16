@@ -822,7 +822,9 @@ pub const ID3D11BlendState = extern struct {
 
 // -- Entry points --------------------------------------------------------
 
-pub extern "d3dcompiler_47" fn D3DCompile(
+// The library that provides D3DCompile is linked by the build (d3dcompiler
+// on the MSVC ABI, d3dcompiler_47 on the GNU ABI), so we don't name it here.
+pub extern fn D3DCompile(
     pSrcData: *const anyopaque,
     SrcDataSize: usize,
     pSourceName: ?[*:0]const u8,

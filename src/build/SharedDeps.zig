@@ -537,7 +537,14 @@ pub fn add(
     {
         step.linkSystemLibrary("d3d11");
         step.linkSystemLibrary("dxgi");
-        step.linkSystemLibrary("d3dcompiler_47");
+        // The shader compiler import library is named differently by the two
+        // Windows toolchains: the Windows SDK (MSVC ABI) ships d3dcompiler.lib,
+        // while MinGW (GNU ABI) provides d3dcompiler_47.
+        if (step.rootModuleTarget().abi == .msvc) {
+            step.linkSystemLibrary("d3dcompiler");
+        } else {
+            step.linkSystemLibrary("d3dcompiler_47");
+        }
     }
 
     // cimgui
