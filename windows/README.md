@@ -31,6 +31,7 @@ implemented yet.
 
 ## Status
 
-Verified to compile (the Zig core and renderer cross-compile for Windows, and
-this host compiles against `ghostty.h`). It has not yet been run on Windows;
-the end-to-end render/input path is validated there.
+The Zig core and renderer cross-compile for Windows, and this host compiles
+and links against `libghostty` (producing `ghostty.exe`). CI builds and
+packages it on Windows. It has not yet been run interactively; the end-to-end
+render/input path is validated on a real Windows machine.

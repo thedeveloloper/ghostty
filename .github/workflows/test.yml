@@ -747,6 +747,46 @@ jobs:
       - name: Build libghostty (MSVC ABI)
         run: zig build -Dapp-runtime=none
 
+  build-windows-app:
+    runs-on: namespace-profile-ghostty-windows
+    timeout-minutes: 45
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+
+      # Build the full libghostty (DLL + import library + header), then build
+      # the native Win32 host against it.
+      - name: Build libghostty
+        run: zig build -Dapp-runtime=none
+
+      - name: Build the Windows app
+        shell: pwsh
+        run: |
+          cmake -S windows -B windows/build -DGHOSTTY_DIR="${{ github.workspace }}/zig-out"
+          cmake --build windows/build --config Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-windows | Out-Null
+          # The exe path depends on the generator (multi-config puts it under
+          # Release/); copy from wherever it landed.
+          Get-ChildItem -Path windows/build -Recurse -Filter ghostty.exe |
+            Select-Object -First 1 |
+            Copy-Item -Destination dist-windows/
+          Copy-Item zig-out/lib/ghostty.dll dist-windows/
+          Compress-Archive -Path dist-windows/* -DestinationPath ghostty-windows.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ghostty-windows
+          path: ghostty-windows.zip
+
   build-linux:
     strategy:
       fail-fast: false
