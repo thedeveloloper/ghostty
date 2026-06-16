@@ -145,7 +145,7 @@ pub fn initShaders(
     custom_shaders: []const [:0]const u8,
 ) !shaders.Shaders {
     _ = alloc;
-    return try shaders.Shaders.init(self.alloc, custom_shaders);
+    return try shaders.Shaders.init(self.device, self.alloc, custom_shaders);
 }
 
 /// Get the current size of the runtime surface.

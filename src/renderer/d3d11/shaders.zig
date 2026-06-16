@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const math = @import("../../math.zig");
 
+const api = @import("api.zig");
 const Pipeline = @import("Pipeline.zig");
 
 const log = std.log.scoped(.directx);
@@ -33,23 +34,24 @@ pub const Shaders = struct {
     /// against the final drawable texture. This is an array of shader source
     /// code, not file paths.
     pub fn init(
+        device: *api.ID3D11Device,
         alloc: Allocator,
         post_shaders: []const [:0]const u8,
     ) !Shaders {
         _ = alloc;
         _ = post_shaders;
 
-        // TODO(windows): build each pipeline from its HLSL source (Phase 2d/2f)
-        // with the appropriate vertex attributes, step function and blending.
-        // For now we construct placeholder pipelines so the backend compiles.
+        // TODO(windows): supply real HLSL source for each pipeline (Phase 2f).
+        // For now we construct pipelines from placeholder source so the
+        // backend compiles; the compile/create machinery is exercised here.
         const placeholder: Pipeline.Options = .{ .vertex_fn = "", .fragment_fn = "" };
         return .{
             .pipelines = .{
-                .bg_color = try Pipeline.init(null, placeholder),
-                .cell_bg = try Pipeline.init(null, placeholder),
-                .cell_text = try Pipeline.init(CellText, placeholder),
-                .image = try Pipeline.init(Image, placeholder),
-                .bg_image = try Pipeline.init(BgImage, placeholder),
+                .bg_color = try Pipeline.init(device, null, placeholder),
+                .cell_bg = try Pipeline.init(device, null, placeholder),
+                .cell_text = try Pipeline.init(device, CellText, placeholder),
+                .image = try Pipeline.init(device, Image, placeholder),
+                .bg_image = try Pipeline.init(device, BgImage, placeholder),
             },
             .post_pipelines = &.{},
         };

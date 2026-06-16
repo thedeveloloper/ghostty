@@ -317,15 +317,31 @@ pub const ID3D11Device = extern struct {
         ) callconv(.winapi) HRESULT,
         CreateDepthStencilView: *const anyopaque,
         CreateInputLayout: *const anyopaque,
-        CreateVertexShader: *const anyopaque,
+        CreateVertexShader: *const fn (
+            *ID3D11Device,
+            *const anyopaque,
+            usize,
+            ?*anyopaque,
+            *?*ID3D11VertexShader,
+        ) callconv(.winapi) HRESULT,
         CreateGeometryShader: *const anyopaque,
         CreateGeometryShaderWithStreamOutput: *const anyopaque,
-        CreatePixelShader: *const anyopaque,
+        CreatePixelShader: *const fn (
+            *ID3D11Device,
+            *const anyopaque,
+            usize,
+            ?*anyopaque,
+            *?*ID3D11PixelShader,
+        ) callconv(.winapi) HRESULT,
         CreateHullShader: *const anyopaque,
         CreateDomainShader: *const anyopaque,
         CreateComputeShader: *const anyopaque,
         CreateClassLinkage: *const anyopaque,
-        CreateBlendState: *const anyopaque,
+        CreateBlendState: *const fn (
+            *ID3D11Device,
+            *const BlendDesc,
+            *?*ID3D11BlendState,
+        ) callconv(.winapi) HRESULT,
         CreateDepthStencilState: *const anyopaque,
         CreateRasterizerState: *const anyopaque,
         CreateSamplerState: *const fn (
@@ -389,6 +405,27 @@ pub const ID3D11Device = extern struct {
         const hr = self.vtable.CreateSamplerState(self, desc, &out);
         if (FAILED(hr)) return error.CreateSamplerStateFailed;
         return out orelse error.CreateSamplerStateFailed;
+    }
+
+    pub inline fn createVertexShader(self: *ID3D11Device, bytecode: []const u8) !*ID3D11VertexShader {
+        var out: ?*ID3D11VertexShader = null;
+        const hr = self.vtable.CreateVertexShader(self, bytecode.ptr, bytecode.len, null, &out);
+        if (FAILED(hr)) return error.CreateVertexShaderFailed;
+        return out orelse error.CreateVertexShaderFailed;
+    }
+
+    pub inline fn createPixelShader(self: *ID3D11Device, bytecode: []const u8) !*ID3D11PixelShader {
+        var out: ?*ID3D11PixelShader = null;
+        const hr = self.vtable.CreatePixelShader(self, bytecode.ptr, bytecode.len, null, &out);
+        if (FAILED(hr)) return error.CreatePixelShaderFailed;
+        return out orelse error.CreatePixelShaderFailed;
+    }
+
+    pub inline fn createBlendState(self: *ID3D11Device, desc: *const BlendDesc) !*ID3D11BlendState {
+        var out: ?*ID3D11BlendState = null;
+        const hr = self.vtable.CreateBlendState(self, desc, &out);
+        if (FAILED(hr)) return error.CreateBlendStateFailed;
+        return out orelse error.CreateBlendStateFailed;
     }
 };
 
@@ -560,7 +597,110 @@ pub const IDXGISwapChain = extern struct {
     }
 };
 
+// -- Pipeline state ------------------------------------------------------
+
+pub const Blend = enum(c_uint) {
+    zero = 1,
+    one = 2,
+    src_alpha = 5,
+    inv_src_alpha = 6,
+};
+
+pub const BlendOp = enum(c_uint) {
+    add = 1,
+};
+
+/// `D3D11_COLOR_WRITE_ENABLE_ALL`.
+pub const COLOR_WRITE_ENABLE_ALL: u8 = 0x0f;
+
+pub const RenderTargetBlendDesc = extern struct {
+    BlendEnable: BOOL = 0,
+    SrcBlend: Blend = .one,
+    DestBlend: Blend = .zero,
+    BlendOp: BlendOp = .add,
+    SrcBlendAlpha: Blend = .one,
+    DestBlendAlpha: Blend = .zero,
+    BlendOpAlpha: BlendOp = .add,
+    RenderTargetWriteMask: u8 = COLOR_WRITE_ENABLE_ALL,
+};
+
+pub const BlendDesc = extern struct {
+    AlphaToCoverageEnable: BOOL = 0,
+    IndependentBlendEnable: BOOL = 0,
+    RenderTarget: [8]RenderTargetBlendDesc = [_]RenderTargetBlendDesc{.{}} ** 8,
+};
+
+/// `ID3DBlob` (a.k.a. ID3D10Blob): a chunk of compiled shader bytecode or
+/// compiler error text.
+pub const ID3DBlob = extern struct {
+    vtable: *const VTable,
+    pub const VTable = extern struct {
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (*ID3DBlob) callconv(.winapi) ULONG,
+        GetBufferPointer: *const fn (*ID3DBlob) callconv(.winapi) ?*anyopaque,
+        GetBufferSize: *const fn (*ID3DBlob) callconv(.winapi) usize,
+    };
+    pub inline fn release(self: *ID3DBlob) void {
+        _ = self.vtable.Release(self);
+    }
+    pub inline fn bytes(self: *ID3DBlob) []const u8 {
+        const ptr: [*]const u8 = @ptrCast(self.vtable.GetBufferPointer(self).?);
+        return ptr[0..self.vtable.GetBufferSize(self)];
+    }
+};
+
+pub const ID3D11VertexShader = extern struct {
+    vtable: *const VTable,
+    pub const VTable = extern struct {
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (*ID3D11VertexShader) callconv(.winapi) ULONG,
+    };
+    pub inline fn release(self: *ID3D11VertexShader) void {
+        _ = self.vtable.Release(self);
+    }
+};
+
+pub const ID3D11PixelShader = extern struct {
+    vtable: *const VTable,
+    pub const VTable = extern struct {
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (*ID3D11PixelShader) callconv(.winapi) ULONG,
+    };
+    pub inline fn release(self: *ID3D11PixelShader) void {
+        _ = self.vtable.Release(self);
+    }
+};
+
+pub const ID3D11BlendState = extern struct {
+    vtable: *const VTable,
+    pub const VTable = extern struct {
+        QueryInterface: *const anyopaque,
+        AddRef: *const anyopaque,
+        Release: *const fn (*ID3D11BlendState) callconv(.winapi) ULONG,
+    };
+    pub inline fn release(self: *ID3D11BlendState) void {
+        _ = self.vtable.Release(self);
+    }
+};
+
 // -- Entry points --------------------------------------------------------
+
+pub extern "d3dcompiler_47" fn D3DCompile(
+    pSrcData: *const anyopaque,
+    SrcDataSize: usize,
+    pSourceName: ?[*:0]const u8,
+    pDefines: ?*const anyopaque,
+    pInclude: ?*anyopaque,
+    pEntrypoint: ?[*:0]const u8,
+    pTarget: ?[*:0]const u8,
+    Flags1: UINT,
+    Flags2: UINT,
+    ppCode: *?*ID3DBlob,
+    ppErrorMsgs: *?*ID3DBlob,
+) callconv(.winapi) HRESULT;
 
 pub extern "d3d11" fn D3D11CreateDeviceAndSwapChain(
     pAdapter: ?*anyopaque,

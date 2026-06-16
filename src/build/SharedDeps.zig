@@ -537,6 +537,7 @@ pub fn add(
     {
         step.linkSystemLibrary("d3d11");
         step.linkSystemLibrary("dxgi");
+        step.linkSystemLibrary("d3dcompiler_47");
     }
 
     // cimgui
