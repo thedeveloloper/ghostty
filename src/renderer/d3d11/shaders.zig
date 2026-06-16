@@ -41,9 +41,6 @@ pub const Shaders = struct {
         _ = alloc;
         _ = post_shaders;
 
-        // TODO(windows): port the remaining shaders to HLSL (Phase 2f);
-        // cell_text/image/bg_image still use placeholder source.
-        const placeholder: Pipeline.Options = .{ .vertex_fn = "", .fragment_fn = "" };
         return .{
             .pipelines = .{
                 .bg_color = try Pipeline.init(device, null, .{
@@ -56,9 +53,24 @@ pub const Shaders = struct {
                     .fragment_fn = loadShaderCode("../shaders/hlsl/cell_bg.f.hlsl"),
                     .blending_enabled = true,
                 }),
-                .cell_text = try Pipeline.init(device, CellText, placeholder),
-                .image = try Pipeline.init(device, Image, placeholder),
-                .bg_image = try Pipeline.init(device, BgImage, placeholder),
+                .cell_text = try Pipeline.init(device, CellText, .{
+                    .vertex_fn = loadShaderCode("../shaders/hlsl/cell_text.v.hlsl"),
+                    .fragment_fn = loadShaderCode("../shaders/hlsl/cell_text.f.hlsl"),
+                    .step_fn = .per_instance,
+                    .blending_enabled = true,
+                }),
+                .image = try Pipeline.init(device, Image, .{
+                    .vertex_fn = loadShaderCode("../shaders/hlsl/image.v.hlsl"),
+                    .fragment_fn = loadShaderCode("../shaders/hlsl/image.f.hlsl"),
+                    .step_fn = .per_instance,
+                    .blending_enabled = true,
+                }),
+                .bg_image = try Pipeline.init(device, BgImage, .{
+                    .vertex_fn = loadShaderCode("../shaders/hlsl/bg_image.v.hlsl"),
+                    .fragment_fn = loadShaderCode("../shaders/hlsl/bg_image.f.hlsl"),
+                    .step_fn = .per_instance,
+                    .blending_enabled = true,
+                }),
             },
             .post_pipelines = &.{},
         };
