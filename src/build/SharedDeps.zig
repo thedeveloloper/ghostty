@@ -531,6 +531,14 @@ pub fn add(
         }
     }
 
+    // Direct3D 11 renderer (Windows).
+    if (step.rootModuleTarget().os.tag == .windows and
+        self.config.renderer == .directx)
+    {
+        step.linkSystemLibrary("d3d11");
+        step.linkSystemLibrary("dxgi");
+    }
+
     // cimgui
     if (b.lazyDependency("dcimgui", .{
         .target = target,
