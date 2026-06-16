@@ -41,14 +41,21 @@ pub const Shaders = struct {
         _ = alloc;
         _ = post_shaders;
 
-        // TODO(windows): supply real HLSL source for each pipeline (Phase 2f).
-        // For now we construct pipelines from placeholder source so the
-        // backend compiles; the compile/create machinery is exercised here.
+        // TODO(windows): port the remaining shaders to HLSL (Phase 2f);
+        // cell_text/image/bg_image still use placeholder source.
         const placeholder: Pipeline.Options = .{ .vertex_fn = "", .fragment_fn = "" };
         return .{
             .pipelines = .{
-                .bg_color = try Pipeline.init(device, null, placeholder),
-                .cell_bg = try Pipeline.init(device, null, placeholder),
+                .bg_color = try Pipeline.init(device, null, .{
+                    .vertex_fn = loadShaderCode("../shaders/hlsl/full_screen.v.hlsl"),
+                    .fragment_fn = loadShaderCode("../shaders/hlsl/bg_color.f.hlsl"),
+                    .blending_enabled = false,
+                }),
+                .cell_bg = try Pipeline.init(device, null, .{
+                    .vertex_fn = loadShaderCode("../shaders/hlsl/full_screen.v.hlsl"),
+                    .fragment_fn = loadShaderCode("../shaders/hlsl/cell_bg.f.hlsl"),
+                    .blending_enabled = true,
+                }),
                 .cell_text = try Pipeline.init(device, CellText, placeholder),
                 .image = try Pipeline.init(device, Image, placeholder),
                 .bg_image = try Pipeline.init(device, BgImage, placeholder),
@@ -205,3 +212,38 @@ pub const BgImage = extern struct {
         };
     };
 };
+
+/// Load shader code from the target path, processing `#include` directives.
+///
+/// Comptime only. Mirrors the OpenGL backend's loader so the HLSL shaders can
+/// share `common.hlsl` without a runtime include handler.
+fn loadShaderCode(comptime path: []const u8) [:0]const u8 {
+    return comptime processIncludes(@embedFile(path), std.fs.path.dirname(path).?);
+}
+
+/// Used by loadShaderCode.
+fn processIncludes(contents: [:0]const u8, basedir: []const u8) [:0]const u8 {
+    @setEvalBranchQuota(100_000);
+    var i: usize = 0;
+    while (i < contents.len) {
+        if (std.mem.startsWith(u8, contents[i..], "#include")) {
+            std.debug.assert(std.mem.startsWith(u8, contents[i..], "#include \""));
+            const start = i + "#include \"".len;
+            const end = std.mem.indexOfScalarPos(u8, contents, start, '"').?;
+            return std.fmt.comptimePrint(
+                "{s}{s}{s}",
+                .{
+                    contents[0..i],
+                    @embedFile(basedir ++ "/" ++ contents[start..end]),
+                    processIncludes(contents[end + 1 ..], basedir),
+                },
+            );
+        }
+        if (std.mem.indexOfPos(u8, contents, i, "\n#")) |j| {
+            i = (j + 1);
+        } else {
+            break;
+        }
+    }
+    return contents;
+}
