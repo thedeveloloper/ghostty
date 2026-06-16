@@ -16,6 +16,10 @@ dsym: ?std.Build.LazyPath,
 pkg_config: ?std.Build.LazyPath,
 pkg_config_static: ?std.Build.LazyPath,
 
+/// On Windows, the import library for the shared library (`*.lib`), which
+/// consumers link against to use the DLL. Null otherwise.
+implib: ?std.Build.LazyPath,
+
 pub fn initStatic(
     b: *std.Build,
     deps: *const SharedDeps,
@@ -65,6 +69,7 @@ pub fn initStatic(
         .dsym = null,
         .pkg_config = null,
         .pkg_config_static = null,
+        .implib = null,
     };
 }
 
@@ -155,6 +160,10 @@ pub fn initShared(
         .dsym = dsymutil,
         .pkg_config = pcs.shared,
         .pkg_config_static = pcs.static,
+        .implib = if (deps.config.target.result.os.tag == .windows)
+            lib.getEmittedImplib()
+        else
+            null,
     };
 }
 
@@ -187,6 +196,7 @@ pub fn initMacOSUniversal(
         .dsym = null,
         .pkg_config = null,
         .pkg_config_static = null,
+        .implib = null,
     };
 }
 
@@ -195,6 +205,14 @@ pub fn install(self: *const GhosttyLib, name: []const u8) void {
     const step = b.getInstallStep();
     const lib_install = b.addInstallLibFile(self.output, name);
     step.dependOn(&lib_install.step);
+
+    // On Windows, also install the import library next to the DLL so
+    // consumers (e.g. the native host app) can link against it. We name it
+    // after the DLL, e.g. ghostty.dll -> ghostty.lib.
+    if (self.implib) |implib| {
+        const stem = if (std.mem.endsWith(u8, name, ".dll")) name[0 .. name.len - 4] else name;
+        step.dependOn(&b.addInstallLibFile(implib, b.fmt("{s}.lib", .{stem})).step);
+    }
 
     if (self.pkg_config) |pc| {
         step.dependOn(&b.addInstallFileWithDir(

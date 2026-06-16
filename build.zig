@@ -194,7 +194,10 @@ pub fn build(b: *std.Build) !void {
         if (!config.target.result.os.tag.isDarwin()) {
             lib_shared.installHeader(); // Only need one header
             if (config.target.result.os.tag == .windows) {
-                lib_shared.install("ghostty-internal.dll");
+                // The shared library is named ghostty.dll (paired with the
+                // ghostty.lib import library) so the native host links and
+                // ships them as ghostty.exe + ghostty.dll.
+                lib_shared.install("ghostty.dll");
                 lib_static.install("ghostty-internal-static.lib");
             } else {
                 lib_shared.install("ghostty-internal.so");
