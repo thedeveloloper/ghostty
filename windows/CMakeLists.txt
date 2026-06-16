@@ -27,6 +27,11 @@ target_link_libraries(ghostty PRIVATE "${GHOSTTY_LIBRARY}")
 target_compile_definitions(ghostty PRIVATE UNICODE _UNICODE WINVER=0x0A00 _WIN32_WINNT=0x0A00)
 
 # MSVC defaults the GUI entry point to WinMain; point it at the wide entry.
+# Also raise the main-thread stack reserve to 16 MB. libghostty is developed
+# against the larger default stacks on macOS/Linux and overflows the 1 MB
+# Windows default during initialization (STACK_OVERFLOW, 0xC00000FD).
 if(MSVC)
-    target_link_options(ghostty PRIVATE /ENTRY:wWinMainCRTStartup)
+    target_link_options(ghostty PRIVATE /ENTRY:wWinMainCRTStartup /STACK:16777216)
+else()
+    target_link_options(ghostty PRIVATE -Wl,--stack,16777216)
 endif()
