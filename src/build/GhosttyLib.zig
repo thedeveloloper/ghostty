@@ -20,6 +20,11 @@ pkg_config_static: ?std.Build.LazyPath,
 /// consumers link against to use the DLL. Null otherwise.
 implib: ?std.Build.LazyPath,
 
+/// On Windows (MSVC, unstripped), the debug symbols (`*.pdb`) for the DLL,
+/// installed next to it so crash backtraces resolve to real symbols. Null
+/// otherwise.
+pdb: ?std.Build.LazyPath,
+
 pub fn initStatic(
     b: *std.Build,
     deps: *const SharedDeps,
@@ -70,6 +75,7 @@ pub fn initStatic(
         .pkg_config = null,
         .pkg_config_static = null,
         .implib = null,
+        .pdb = null,
     };
 }
 
@@ -164,6 +170,12 @@ pub fn initShared(
             lib.getEmittedImplib()
         else
             null,
+        .pdb = if (deps.config.target.result.os.tag == .windows and
+            deps.config.target.result.abi == .msvc and
+            !deps.config.strip)
+            lib.getEmittedPdb()
+        else
+            null,
     };
 }
 
@@ -197,6 +209,7 @@ pub fn initMacOSUniversal(
         .pkg_config = null,
         .pkg_config_static = null,
         .implib = null,
+        .pdb = null,
     };
 }
 
@@ -212,6 +225,13 @@ pub fn install(self: *const GhosttyLib, name: []const u8) void {
     if (self.implib) |implib| {
         const stem = if (std.mem.endsWith(u8, name, ".dll")) name[0 .. name.len - 4] else name;
         step.dependOn(&b.addInstallLibFile(implib, b.fmt("{s}.lib", .{stem})).step);
+    }
+
+    // Install the DLL's debug symbols next to it, e.g. ghostty.dll ->
+    // ghostty.pdb, so crash backtraces resolve to real symbols.
+    if (self.pdb) |pdb| {
+        const stem = if (std.mem.endsWith(u8, name, ".dll")) name[0 .. name.len - 4] else name;
+        step.dependOn(&b.addInstallLibFile(pdb, b.fmt("{s}.pdb", .{stem})).step);
     }
 
     if (self.pkg_config) |pc| {
