@@ -25,6 +25,16 @@ struct Host {
     ghostty_app_t app = nullptr;
     ghostty_surface_t surface = nullptr;
     HWND hwnd = nullptr;
+
+    // Current mouse cursor and whether it should be shown, applied in
+    // WM_SETCURSOR (Windows resets the cursor on each one).
+    HCURSOR cursor = nullptr;
+    bool cursor_visible = true;
+
+    // Saved window state for toggling borderless fullscreen.
+    bool fullscreen = false;
+    WINDOWPLACEMENT prev_placement = {sizeof(WINDOWPLACEMENT)};
+    LONG_PTR prev_style = 0;
 };
 
 Host g_host;
@@ -83,19 +93,155 @@ void wakeupCb(void* userdata) {
     }
 }
 
+// Map a ghostty mouse shape to a standard Win32 cursor.
+LPCWSTR mouseShapeCursor(ghostty_action_mouse_shape_e shape) {
+    switch (shape) {
+    case GHOSTTY_MOUSE_SHAPE_TEXT:
+    case GHOSTTY_MOUSE_SHAPE_VERTICAL_TEXT:
+    case GHOSTTY_MOUSE_SHAPE_CELL:
+        return IDC_IBEAM;
+    case GHOSTTY_MOUSE_SHAPE_POINTER:
+    case GHOSTTY_MOUSE_SHAPE_ALIAS:
+        return IDC_HAND;
+    case GHOSTTY_MOUSE_SHAPE_CROSSHAIR:
+        return IDC_CROSS;
+    case GHOSTTY_MOUSE_SHAPE_WAIT:
+        return IDC_WAIT;
+    case GHOSTTY_MOUSE_SHAPE_PROGRESS:
+        return IDC_APPSTARTING;
+    case GHOSTTY_MOUSE_SHAPE_NOT_ALLOWED:
+    case GHOSTTY_MOUSE_SHAPE_NO_DROP:
+        return IDC_NO;
+    case GHOSTTY_MOUSE_SHAPE_MOVE:
+    case GHOSTTY_MOUSE_SHAPE_ALL_SCROLL:
+        return IDC_SIZEALL;
+    case GHOSTTY_MOUSE_SHAPE_COL_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_E_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_W_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_EW_RESIZE:
+        return IDC_SIZEWE;
+    case GHOSTTY_MOUSE_SHAPE_ROW_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_N_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_S_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_NS_RESIZE:
+        return IDC_SIZENS;
+    case GHOSTTY_MOUSE_SHAPE_NE_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_SW_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_NESW_RESIZE:
+        return IDC_SIZENESW;
+    case GHOSTTY_MOUSE_SHAPE_NW_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_SE_RESIZE:
+    case GHOSTTY_MOUSE_SHAPE_NWSE_RESIZE:
+        return IDC_SIZENWSE;
+    default:
+        return IDC_ARROW;
+    }
+}
+
+// Toggle borderless fullscreen, saving and restoring the window style and
+// placement.
+void toggleFullscreen(Host* host) {
+    HWND hwnd = host->hwnd;
+    if (!host->fullscreen) {
+        host->prev_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        GetWindowPlacement(hwnd, &host->prev_placement);
+        MONITORINFO mi = {sizeof(mi)};
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            SetWindowLongPtrW(hwnd, GWL_STYLE,
+                              host->prev_style & ~static_cast<LONG_PTR>(WS_OVERLAPPEDWINDOW));
+            SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                         mi.rcMonitor.right - mi.rcMonitor.left,
+                         mi.rcMonitor.bottom - mi.rcMonitor.top,
+                         SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            host->fullscreen = true;
+        }
+    } else {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, host->prev_style);
+        SetWindowPlacement(hwnd, &host->prev_placement);
+        SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        host->fullscreen = false;
+    }
+}
+
+// Open a (url, len) pair with the system default handler.
+void openUrl(const char* url, uintptr_t len) {
+    if (url == nullptr || len == 0)
+        return;
+    const int wn = MultiByteToWideChar(CP_UTF8, 0, url, static_cast<int>(len), nullptr, 0);
+    if (wn <= 0)
+        return;
+    std::wstring wide(static_cast<size_t>(wn), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, url, static_cast<int>(len), wide.data(), wn);
+    ShellExecuteW(nullptr, L"open", wide.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
 bool actionCb(ghostty_app_t app, ghostty_target_s target, ghostty_action_s action) {
     (void)app;
     (void)target;
+    Host* host = &g_host;
+    if (host->hwnd == nullptr)
+        return false;
+
     switch (action.tag) {
     case GHOSTTY_ACTION_RENDER:
-        if (g_host.hwnd != nullptr)
-            InvalidateRect(g_host.hwnd, nullptr, FALSE);
+        InvalidateRect(host->hwnd, nullptr, FALSE);
         return true;
 
     case GHOSTTY_ACTION_SET_TITLE:
-        if (g_host.hwnd != nullptr && action.action.set_title.title != nullptr) {
-            SetWindowTextA(g_host.hwnd, action.action.set_title.title);
+        if (action.action.set_title.title != nullptr) {
+            SetWindowTextA(host->hwnd, action.action.set_title.title);
         }
+        return true;
+
+    case GHOSTTY_ACTION_MOUSE_SHAPE:
+        host->cursor = LoadCursorW(nullptr, mouseShapeCursor(action.action.mouse_shape));
+        SetCursor(host->cursor);
+        return true;
+
+    case GHOSTTY_ACTION_MOUSE_VISIBILITY:
+        host->cursor_visible = action.action.mouse_visibility == GHOSTTY_MOUSE_VISIBLE;
+        SetCursor(host->cursor_visible ? host->cursor : nullptr);
+        return true;
+
+    case GHOSTTY_ACTION_TOGGLE_FULLSCREEN:
+        toggleFullscreen(host);
+        return true;
+
+    case GHOSTTY_ACTION_TOGGLE_MAXIMIZE:
+        ShowWindow(host->hwnd, IsZoomed(host->hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+        return true;
+
+    case GHOSTTY_ACTION_TOGGLE_WINDOW_DECORATIONS: {
+        const LONG_PTR style = GetWindowLongPtrW(host->hwnd, GWL_STYLE);
+        SetWindowLongPtrW(host->hwnd, GWL_STYLE,
+                          style ^ static_cast<LONG_PTR>(WS_OVERLAPPEDWINDOW));
+        SetWindowPos(host->hwnd, nullptr, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        return true;
+    }
+
+    case GHOSTTY_ACTION_INITIAL_SIZE: {
+        RECT r = {0, 0, static_cast<LONG>(action.action.initial_size.width),
+                  static_cast<LONG>(action.action.initial_size.height)};
+        const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(host->hwnd, GWL_STYLE));
+        AdjustWindowRectExForDpi(&r, style, FALSE, 0, GetDpiForWindow(host->hwnd));
+        SetWindowPos(host->hwnd, nullptr, 0, 0, r.right - r.left, r.bottom - r.top,
+                     SWP_NOMOVE | SWP_NOZORDER);
+        return true;
+    }
+
+    case GHOSTTY_ACTION_PRESENT_TERMINAL:
+        ShowWindow(host->hwnd, SW_RESTORE);
+        SetForegroundWindow(host->hwnd);
+        return true;
+
+    case GHOSTTY_ACTION_RING_BELL:
+        MessageBeep(MB_OK);
+        return true;
+
+    case GHOSTTY_ACTION_OPEN_URL:
+        openUrl(action.action.open_url.url, action.action.open_url.len);
         return true;
 
     case GHOSTTY_ACTION_QUIT:
@@ -103,8 +249,10 @@ bool actionCb(ghostty_app_t app, ghostty_target_s target, ghostty_action_s actio
         PostQuitMessage(0);
         return true;
 
+    // TODO(windows): NEW_WINDOW/NEW_TAB/CLOSE_TAB/NEW_SPLIT require managing
+    // multiple surfaces and a tab/split UI, which this single-window host does
+    // not do yet. Desktop notifications also need a toast implementation.
     default:
-        // Unhandled actions are fine to ignore for the proof of concept.
         return false;
     }
 }
@@ -296,6 +444,15 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         handleKey(host, msg, wparam, lparam);
         return 0;
 
+    case WM_SETCURSOR:
+        // Apply our tracked cursor over the client area; let the system
+        // handle borders/resize edges.
+        if (LOWORD(lparam) == HTCLIENT) {
+            SetCursor(host->cursor_visible ? host->cursor : nullptr);
+            return TRUE;
+        }
+        break;
+
     case WM_MOUSEMOVE:
         if (host->surface != nullptr) {
             ghostty_surface_mouse_pos(host->surface, static_cast<double>(GET_X_LPARAM(lparam)),
@@ -388,6 +545,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     wc.hCursor = LoadCursor(nullptr, IDC_IBEAM);
     wc.lpszClassName = class_name;
     RegisterClassExW(&wc);
+
+    g_host.cursor = LoadCursorW(nullptr, IDC_IBEAM);
 
     g_host.hwnd = CreateWindowExW(0, class_name, L"Ghostty", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
                                   CW_USEDEFAULT, 800, 600, nullptr, nullptr, hInstance, nullptr);
