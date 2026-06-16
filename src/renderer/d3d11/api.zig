@@ -688,10 +688,26 @@ pub const IDXGISwapChain = extern struct {
         SetFullscreenState: *const anyopaque,
         GetFullscreenState: *const anyopaque,
         GetDesc: *const fn (*IDXGISwapChain, *SwapChainDesc) callconv(.winapi) HRESULT,
+        ResizeBuffers: *const fn (
+            *IDXGISwapChain,
+            UINT,
+            UINT,
+            UINT,
+            Format,
+            UINT,
+        ) callconv(.winapi) HRESULT,
     };
 
     pub inline fn release(self: *IDXGISwapChain) void {
         _ = self.vtable.Release(self);
+    }
+
+    /// Resize the swap chain's buffers. A count/format of 0/unknown preserves
+    /// the existing value. All references to the back buffers must be released
+    /// before calling this.
+    pub inline fn resizeBuffers(self: *IDXGISwapChain, width: UINT, height: UINT) !void {
+        const hr = self.vtable.ResizeBuffers(self, 0, width, height, .unknown, 0);
+        if (FAILED(hr)) return error.ResizeBuffersFailed;
     }
 
     pub inline fn present(self: *IDXGISwapChain, sync_interval: UINT, flags: UINT) !void {

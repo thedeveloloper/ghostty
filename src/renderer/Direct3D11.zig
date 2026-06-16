@@ -174,11 +174,34 @@ pub fn initTarget(self: *const Direct3D11, width: usize, height: usize) !Target 
 /// Present the provided target.
 pub fn present(self: *Direct3D11, target: Target) !void {
     self.last_target = target;
+
+    // Keep the swap chain back buffer the same size as the target, resizing it
+    // when the window (and thus the rendered target) has changed size. Without
+    // this the back buffer and target dimensions diverge and CopyResource
+    // fails after a resize.
+    const desc = try self.swap_chain.getDesc();
+    if (desc.BufferDesc.Width != target.width or desc.BufferDesc.Height != target.height) {
+        try self.resizeSwapChain(@intCast(target.width), @intCast(target.height));
+    }
+
     // Copy the rendered target into the swap chain back buffer, then present.
-    // TODO(windows): handle resize via IDXGISwapChain::ResizeBuffers so the
-    // back buffer and target dimensions stay in sync.
     self.context.copyResource(self.back_buffer, target.texture.resource());
     try self.swap_chain.present(1, 0);
+}
+
+/// Resize the swap chain back buffer and recreate its render target view.
+fn resizeSwapChain(self: *Direct3D11, width: u32, height: u32) !void {
+    // All references to the back buffer must be released before resizing.
+    self.render_target.release();
+    self.back_buffer.release();
+
+    try self.swap_chain.resizeBuffers(width, height);
+
+    const back_buffer = try self.swap_chain.getBuffer(0);
+    errdefer back_buffer.release();
+    const rtv = try self.device.createRenderTargetView(back_buffer);
+    self.back_buffer = back_buffer;
+    self.render_target = rtv;
 }
 
 /// Present the last presented target again.
