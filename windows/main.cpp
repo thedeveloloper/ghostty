@@ -2,12 +2,13 @@
 //
 // This embeds libghostty through its C API (include/ghostty.h), the same way
 // the macOS app embeds it through Swift. The top-level window owns a tab strip
-// and routes events; each terminal surface lives in its own child window (one
-// surface <-> one HWND <-> one Direct3D swap chain). Keyboard, mouse, and
-// clipboard input are translated to the core's input API.
+// and routes events. Each terminal surface lives in its own child window (one
+// surface <-> one HWND <-> one Direct3D swap chain). A tab is a binary split
+// tree of panes, so a tab can be divided into multiple surfaces. Keyboard,
+// mouse, and clipboard input are translated to the core's input API.
 //
-// Out of scope for now: split panes within a tab, full IME composition, native
-// settings UI, and desktop-notification toasts.
+// Out of scope for now: full IME composition, native settings UI, and
+// desktop-notification toasts.
 
 #include <windows.h>
 #include <windowsx.h>
@@ -20,26 +21,43 @@
 
 namespace {
 
-// One terminal surface, hosted in a child window of the top-level window.
+// One terminal surface, hosted in a child window.
 struct Surface {
     HWND hwnd = nullptr;
     ghostty_surface_t surface = nullptr;
     std::string title;
 
-    // Current cursor and visibility, applied in WM_SETCURSOR.
     HCURSOR cursor = nullptr;
     bool cursor_visible = true;
 };
 
-// The application: one libghostty app, a top-level window, and a list of tabs
-// (each tab is currently a single surface; split panes come later).
+// A node in a tab's split tree: a leaf (one surface) or a split of two panes.
+struct Pane {
+    Surface* surface = nullptr; // non-null for a leaf
+    Pane* a = nullptr;          // children for a split (a is left/top)
+    Pane* b = nullptr;
+    Pane* parent = nullptr;
+    bool vertical = false;    // true: a over b; false: a beside b
+    double ratio = 0.5;       // fraction of the split given to `a`
+    RECT rect = {0, 0, 0, 0}; // last laid-out rect, used for spatial nav
+
+    bool leaf() const { return surface != nullptr; }
+};
+
+// A tab: a split tree plus the focused leaf and an optional zoom.
+struct Tab {
+    Pane* root = nullptr;
+    Surface* focused = nullptr;
+    bool zoomed = false;
+};
+
+// The application: one libghostty app, a top-level window, and a list of tabs.
 struct App {
     ghostty_app_t app = nullptr;
     HWND hwnd = nullptr;
-    std::vector<Surface*> tabs;
+    std::vector<Tab*> tabs;
     size_t active = 0;
 
-    // Saved window state for toggling borderless fullscreen.
     bool fullscreen = false;
     WINDOWPLACEMENT prev_placement = {sizeof(WINDOWPLACEMENT)};
     LONG_PTR prev_style = 0;
@@ -57,6 +75,8 @@ double dpiScale(HWND hwnd) {
 }
 
 int tabBarHeight(HWND hwnd) { return static_cast<int>(28.0 * dpiScale(hwnd)); }
+
+Surface* createSurface(App* app); // forward declaration
 
 //----------------------------------------------------------------------------//
 // Input helpers
@@ -85,8 +105,6 @@ ghostty_input_mods_e currentMods() {
     return static_cast<ghostty_input_mods_e>(mods);
 }
 
-// The Windows scan code keys the core's keycode table (Chromium's "win"
-// column); extended keys get the 0xE000 prefix.
 uint32_t scancodeFromLParam(LPARAM lparam) {
     const uint32_t sc = static_cast<uint32_t>((lparam >> 16) & 0xFF);
     const bool extended = (lparam & (1 << 24)) != 0;
@@ -138,27 +156,110 @@ LPCWSTR mouseShapeCursor(ghostty_action_mouse_shape_e shape) {
 }
 
 //----------------------------------------------------------------------------//
-// Tab management
+// Split tree helpers
 //----------------------------------------------------------------------------//
 
-Surface* activeSurface(App* app) { return app->tabs.empty() ? nullptr : app->tabs[app->active]; }
+void collectLeaves(Pane* pane, std::vector<Pane*>& out) {
+    if (pane == nullptr)
+        return;
+    if (pane->leaf()) {
+        out.push_back(pane);
+    } else {
+        collectLeaves(pane->a, out);
+        collectLeaves(pane->b, out);
+    }
+}
 
-// Place the active surface's child window over the content area (below the tab
-// strip) and hide the others.
+Pane* firstLeaf(Pane* pane) {
+    while (pane != nullptr && !pane->leaf())
+        pane = pane->a;
+    return pane;
+}
+
+Pane* paneForSurface(Pane* pane, Surface* s) {
+    if (pane == nullptr)
+        return nullptr;
+    if (pane->leaf())
+        return pane->surface == s ? pane : nullptr;
+    Pane* found = paneForSurface(pane->a, s);
+    return found != nullptr ? found : paneForSurface(pane->b, s);
+}
+
+Tab* tabForSurface(App* app, Surface* s) {
+    for (Tab* tab : app->tabs) {
+        if (paneForSurface(tab->root, s) != nullptr)
+            return tab;
+    }
+    return nullptr;
+}
+
+// Lay out a pane subtree within `rect`, positioning leaf child windows.
+void layoutPane(Pane* pane, RECT rect) {
+    if (pane == nullptr)
+        return;
+    pane->rect = rect;
+    if (pane->leaf()) {
+        SetWindowPos(pane->surface->hwnd, nullptr, rect.left, rect.top, rect.right - rect.left,
+                     rect.bottom - rect.top, SWP_NOZORDER | SWP_SHOWWINDOW);
+        return;
+    }
+    if (pane->vertical) {
+        const int split = rect.top + static_cast<int>((rect.bottom - rect.top) * pane->ratio);
+        layoutPane(pane->a, {rect.left, rect.top, rect.right, split});
+        layoutPane(pane->b, {rect.left, split, rect.right, rect.bottom});
+    } else {
+        const int split = rect.left + static_cast<int>((rect.right - rect.left) * pane->ratio);
+        layoutPane(pane->a, {rect.left, rect.top, split, rect.bottom});
+        layoutPane(pane->b, {split, rect.top, rect.right, rect.bottom});
+    }
+}
+
+Surface* activeSurface(App* app) {
+    if (app->tabs.empty())
+        return nullptr;
+    return app->tabs[app->active]->focused;
+}
+
+// Show/position the active tab's panes; hide every other tab's surfaces.
 void layoutTabs(App* app) {
     RECT client;
     GetClientRect(app->hwnd, &client);
     const int bar = tabBarHeight(app->hwnd);
+    const RECT content = {client.left, client.top + bar, client.right, client.bottom};
+
     for (size_t i = 0; i < app->tabs.size(); i++) {
-        HWND child = app->tabs[i]->hwnd;
-        if (i == app->active) {
-            SetWindowPos(child, nullptr, client.left, client.top + bar, client.right - client.left,
-                         client.bottom - client.top - bar, SWP_NOZORDER | SWP_SHOWWINDOW);
+        Tab* tab = app->tabs[i];
+        std::vector<Pane*> leaves;
+        collectLeaves(tab->root, leaves);
+        if (i != app->active) {
+            for (Pane* leaf : leaves)
+                ShowWindow(leaf->surface->hwnd, SW_HIDE);
+            continue;
+        }
+        if (tab->zoomed && tab->focused != nullptr) {
+            for (Pane* leaf : leaves) {
+                if (leaf->surface == tab->focused) {
+                    SetWindowPos(leaf->surface->hwnd, nullptr, content.left, content.top,
+                                 content.right - content.left, content.bottom - content.top,
+                                 SWP_NOZORDER | SWP_SHOWWINDOW);
+                } else {
+                    ShowWindow(leaf->surface->hwnd, SW_HIDE);
+                }
+            }
         } else {
-            ShowWindow(child, SW_HIDE);
+            layoutPane(tab->root, content);
         }
     }
     InvalidateRect(app->hwnd, nullptr, FALSE);
+}
+
+void focusSurface(App* app, Surface* s) {
+    if (s == nullptr)
+        return;
+    Tab* tab = tabForSurface(app, s);
+    if (tab != nullptr)
+        tab->focused = s;
+    SetFocus(s->hwnd);
 }
 
 void setActiveTab(App* app, size_t index) {
@@ -173,39 +274,228 @@ void setActiveTab(App* app, size_t index) {
     }
 }
 
-Surface* createSurface(App* app); // forward declaration
-
 void addTab(App* app) {
     Surface* s = createSurface(app);
     if (s == nullptr)
         return;
-    app->tabs.push_back(s);
+    auto* tab = new Tab();
+    tab->root = new Pane();
+    tab->root->surface = s;
+    tab->focused = s;
+    app->tabs.push_back(tab);
     setActiveTab(app, app->tabs.size() - 1);
 }
 
-void closeTabAt(App* app, size_t index) {
-    if (index >= app->tabs.size())
+// Split the focused pane, creating a new surface beside or below it.
+void splitFocused(App* app, Tab* tab, ghostty_action_split_direction_e dir) {
+    Pane* leaf = paneForSurface(tab->root, tab->focused);
+    if (leaf == nullptr)
         return;
-    Surface* s = app->tabs[index];
-    ghostty_surface_free(s->surface);
-    DestroyWindow(s->hwnd);
-    delete s;
-    app->tabs.erase(app->tabs.begin() + static_cast<long>(index));
+    Surface* ns = createSurface(app);
+    if (ns == nullptr)
+        return;
 
-    if (app->tabs.empty()) {
-        PostQuitMessage(0);
-        return;
+    auto* split = new Pane();
+    split->vertical = (dir == GHOSTTY_SPLIT_DIRECTION_DOWN || dir == GHOSTTY_SPLIT_DIRECTION_UP);
+    split->parent = leaf->parent;
+
+    auto* new_leaf = new Pane();
+    new_leaf->surface = ns;
+    new_leaf->parent = split;
+
+    const bool new_first =
+        (dir == GHOSTTY_SPLIT_DIRECTION_LEFT || dir == GHOSTTY_SPLIT_DIRECTION_UP);
+    split->a = new_first ? new_leaf : leaf;
+    split->b = new_first ? leaf : new_leaf;
+
+    Pane* parent = leaf->parent;
+    leaf->parent = split;
+    if (parent == nullptr) {
+        tab->root = split;
+    } else if (parent->a == leaf) {
+        parent->a = split;
+    } else {
+        parent->b = split;
     }
-    setActiveTab(app, app->active >= app->tabs.size() ? app->tabs.size() - 1 : app->active);
+
+    tab->focused = ns;
+    tab->zoomed = false;
+    layoutTabs(app);
 }
 
-// Find the tab index hosting the given libghostty surface, or -1.
-ptrdiff_t indexOfSurface(App* app, ghostty_surface_t surface) {
+void removeTab(App* app, Tab* tab) {
     for (size_t i = 0; i < app->tabs.size(); i++) {
-        if (app->tabs[i]->surface == surface)
-            return static_cast<ptrdiff_t>(i);
+        if (app->tabs[i] != tab)
+            continue;
+        app->tabs.erase(app->tabs.begin() + static_cast<long>(i));
+        delete tab;
+        if (app->tabs.empty()) {
+            PostQuitMessage(0);
+            return;
+        }
+        setActiveTab(app, app->active >= app->tabs.size() ? app->tabs.size() - 1 : app->active);
+        return;
     }
-    return -1;
+}
+
+void freeTree(Pane* pane) {
+    if (pane == nullptr)
+        return;
+    freeTree(pane->a);
+    freeTree(pane->b);
+    delete pane;
+}
+
+// Close a single surface, collapsing its split (or closing the tab if it was
+// the tab's only pane).
+void closeSurface(App* app, Surface* s) {
+    Tab* tab = tabForSurface(app, s);
+    if (tab == nullptr)
+        return;
+    Pane* leaf = paneForSurface(tab->root, s);
+    Pane* parent = leaf->parent;
+
+    ghostty_surface_free(s->surface);
+    DestroyWindow(s->hwnd);
+
+    if (parent == nullptr) {
+        // The tab's only pane: the whole tab goes away.
+        delete leaf;
+        tab->root = nullptr;
+        delete s;
+        removeTab(app, tab);
+        return;
+    }
+
+    // Replace the parent split with the surviving sibling.
+    Pane* sibling = (parent->a == leaf) ? parent->b : parent->a;
+    Pane* grand = parent->parent;
+    sibling->parent = grand;
+    if (grand == nullptr) {
+        tab->root = sibling;
+    } else if (grand->a == parent) {
+        grand->a = sibling;
+    } else {
+        grand->b = sibling;
+    }
+    delete leaf;
+    delete parent;
+
+    if (tab->focused == s) {
+        Pane* nf = firstLeaf(sibling);
+        tab->focused = nf != nullptr ? nf->surface : nullptr;
+    }
+    tab->zoomed = false;
+    delete s;
+
+    if (tab == app->tabs[app->active]) {
+        layoutTabs(app);
+        focusSurface(app, tab->focused);
+    }
+}
+
+// Move focus to another pane in the tab, by order or by direction.
+void gotoSplit(App* app, Tab* tab, ghostty_action_goto_split_e dir) {
+    std::vector<Pane*> leaves;
+    collectLeaves(tab->root, leaves);
+    if (leaves.size() < 2)
+        return;
+
+    Pane* current = paneForSurface(tab->root, tab->focused);
+    if (current == nullptr)
+        return;
+
+    if (dir == GHOSTTY_GOTO_SPLIT_PREVIOUS || dir == GHOSTTY_GOTO_SPLIT_NEXT) {
+        size_t idx = 0;
+        for (size_t i = 0; i < leaves.size(); i++) {
+            if (leaves[i] == current)
+                idx = i;
+        }
+        const size_t n = leaves.size();
+        idx = (dir == GHOSTTY_GOTO_SPLIT_NEXT) ? (idx + 1) % n : (idx + n - 1) % n;
+        focusSurface(app, leaves[idx]->surface);
+        return;
+    }
+
+    // Directional: pick the nearest leaf whose center lies in that direction.
+    const int cx = (current->rect.left + current->rect.right) / 2;
+    const int cy = (current->rect.top + current->rect.bottom) / 2;
+    Pane* best = nullptr;
+    long best_dist = 0;
+    for (Pane* leaf : leaves) {
+        if (leaf == current)
+            continue;
+        const int lx = (leaf->rect.left + leaf->rect.right) / 2;
+        const int ly = (leaf->rect.top + leaf->rect.bottom) / 2;
+        bool ok = false;
+        switch (dir) {
+        case GHOSTTY_GOTO_SPLIT_LEFT:
+            ok = lx < cx;
+            break;
+        case GHOSTTY_GOTO_SPLIT_RIGHT:
+            ok = lx > cx;
+            break;
+        case GHOSTTY_GOTO_SPLIT_UP:
+            ok = ly < cy;
+            break;
+        case GHOSTTY_GOTO_SPLIT_DOWN:
+            ok = ly > cy;
+            break;
+        default:
+            break;
+        }
+        if (!ok)
+            continue;
+        const long dist = (lx - cx) * (lx - cx) + (ly - cy) * (ly - cy);
+        if (best == nullptr || dist < best_dist) {
+            best = leaf;
+            best_dist = dist;
+        }
+    }
+    if (best != nullptr)
+        focusSurface(app, best->surface);
+}
+
+// Resize the focused pane's enclosing split in the given direction.
+void resizeSplit(App* app, Tab* tab, ghostty_action_resize_split_s rs) {
+    Pane* leaf = paneForSurface(tab->root, tab->focused);
+    if (leaf == nullptr)
+        return;
+    const bool want_vertical =
+        (rs.direction == GHOSTTY_RESIZE_SPLIT_UP || rs.direction == GHOSTTY_RESIZE_SPLIT_DOWN);
+
+    // Walk up to the nearest split with the matching orientation.
+    Pane* node = leaf;
+    while (node->parent != nullptr && node->parent->vertical != want_vertical)
+        node = node->parent;
+    Pane* split = node->parent;
+    if (split == nullptr)
+        return;
+
+    const int extent = want_vertical ? (split->rect.bottom - split->rect.top)
+                                     : (split->rect.right - split->rect.left);
+    if (extent <= 0)
+        return;
+    double delta = static_cast<double>(rs.amount) / extent;
+    // Growing the focused side means increasing `a` when focus is in `a`.
+    const bool grow =
+        (rs.direction == GHOSTTY_RESIZE_SPLIT_DOWN || rs.direction == GHOSTTY_RESIZE_SPLIT_RIGHT);
+    if (split->b == node || !grow)
+        delta = -delta;
+    split->ratio += delta;
+    if (split->ratio < 0.05)
+        split->ratio = 0.05;
+    if (split->ratio > 0.95)
+        split->ratio = 0.95;
+    layoutTabs(app);
+}
+
+void equalizeSplits(Pane* pane) {
+    if (pane == nullptr || pane->leaf())
+        return;
+    pane->ratio = 0.5;
+    equalizeSplits(pane->a);
+    equalizeSplits(pane->b);
 }
 
 //----------------------------------------------------------------------------//
@@ -263,15 +553,21 @@ bool actionCb(ghostty_app_t app_handle, ghostty_target_s target, ghostty_action_
     if (app->hwnd == nullptr)
         return false;
 
-    // The surface this action targets, if any.
+    // Resolve the targeted surface by its libghostty handle, if any.
     Surface* surface = nullptr;
     if (target.tag == GHOSTTY_TARGET_SURFACE) {
-        const ptrdiff_t i = indexOfSurface(app, target.target.surface);
-        if (i >= 0)
-            surface = app->tabs[static_cast<size_t>(i)];
+        for (Tab* tab : app->tabs) {
+            std::vector<Pane*> leaves;
+            collectLeaves(tab->root, leaves);
+            for (Pane* leaf : leaves) {
+                if (leaf->surface->surface == target.target.surface)
+                    surface = leaf->surface;
+            }
+        }
     }
     if (surface == nullptr)
         surface = activeSurface(app);
+    Tab* tab = surface != nullptr ? tabForSurface(app, surface) : nullptr;
 
     switch (action.tag) {
     case GHOSTTY_ACTION_RENDER:
@@ -283,9 +579,8 @@ bool actionCb(ghostty_app_t app_handle, ghostty_target_s target, ghostty_action_
         if (surface != nullptr && action.action.set_title.title != nullptr) {
             surface->title = action.action.set_title.title;
             InvalidateRect(app->hwnd, nullptr, FALSE);
-            if (surface == activeSurface(app)) {
+            if (surface == activeSurface(app))
                 SetWindowTextA(app->hwnd, surface->title.c_str());
-            }
         }
         return true;
 
@@ -308,10 +603,11 @@ bool actionCb(ghostty_app_t app_handle, ghostty_target_s target, ghostty_action_
         return true;
 
     case GHOSTTY_ACTION_CLOSE_TAB:
-        if (surface != nullptr) {
-            const ptrdiff_t i = indexOfSurface(app, surface->surface);
-            if (i >= 0)
-                closeTabAt(app, static_cast<size_t>(i));
+        if (tab != nullptr) {
+            std::vector<Pane*> leaves;
+            collectLeaves(tab->root, leaves);
+            for (Pane* leaf : leaves)
+                closeSurface(app, leaf->surface);
         }
         return true;
 
@@ -320,19 +616,48 @@ bool actionCb(ghostty_app_t app_handle, ghostty_target_s target, ghostty_action_
         if (n == 0)
             return true;
         const int v = static_cast<int>(action.action.goto_tab);
-        size_t target_index = app->active;
+        size_t idx = app->active;
         if (v == GHOSTTY_GOTO_TAB_PREVIOUS) {
-            target_index = (app->active + static_cast<size_t>(n) - 1) % static_cast<size_t>(n);
+            idx = (app->active + static_cast<size_t>(n) - 1) % static_cast<size_t>(n);
         } else if (v == GHOSTTY_GOTO_TAB_NEXT) {
-            target_index = (app->active + 1) % static_cast<size_t>(n);
+            idx = (app->active + 1) % static_cast<size_t>(n);
         } else if (v == GHOSTTY_GOTO_TAB_LAST) {
-            target_index = static_cast<size_t>(n - 1);
+            idx = static_cast<size_t>(n - 1);
         } else if (v >= 0 && v < n) {
-            target_index = static_cast<size_t>(v);
+            idx = static_cast<size_t>(v);
         }
-        setActiveTab(app, target_index);
+        setActiveTab(app, idx);
         return true;
     }
+
+    case GHOSTTY_ACTION_NEW_SPLIT:
+        if (tab != nullptr)
+            splitFocused(app, tab, action.action.new_split);
+        return true;
+
+    case GHOSTTY_ACTION_GOTO_SPLIT:
+        if (tab != nullptr)
+            gotoSplit(app, tab, action.action.goto_split);
+        return true;
+
+    case GHOSTTY_ACTION_RESIZE_SPLIT:
+        if (tab != nullptr)
+            resizeSplit(app, tab, action.action.resize_split);
+        return true;
+
+    case GHOSTTY_ACTION_EQUALIZE_SPLITS:
+        if (tab != nullptr) {
+            equalizeSplits(tab->root);
+            layoutTabs(app);
+        }
+        return true;
+
+    case GHOSTTY_ACTION_TOGGLE_SPLIT_ZOOM:
+        if (tab != nullptr) {
+            tab->zoomed = !tab->zoomed;
+            layoutTabs(app);
+        }
+        return true;
 
     case GHOSTTY_ACTION_TOGGLE_FULLSCREEN:
         toggleFullscreen(app);
@@ -378,8 +703,7 @@ bool actionCb(ghostty_app_t app_handle, ghostty_target_s target, ghostty_action_
         PostQuitMessage(0);
         return true;
 
-    // TODO(windows): split panes (NEW_SPLIT/GOTO_SPLIT/...) and desktop
-    // notification toasts are not implemented yet.
+    // TODO(windows): desktop-notification toasts are not implemented yet.
     default:
         return false;
     }
@@ -460,11 +784,8 @@ void writeClipboardCb(void* userdata, ghostty_clipboard_e location,
 void closeSurfaceCb(void* userdata, bool process_alive) {
     (void)process_alive;
     auto* surface = static_cast<Surface*>(userdata);
-    if (surface == nullptr)
-        return;
-    const ptrdiff_t i = indexOfSurface(&g_app, surface->surface);
-    if (i >= 0)
-        closeTabAt(&g_app, static_cast<size_t>(i));
+    if (surface != nullptr)
+        closeSurface(&g_app, surface);
 }
 
 //----------------------------------------------------------------------------//
@@ -513,6 +834,7 @@ void handleMouseButton(Surface* s, ghostty_input_mouse_state_e state,
     if (s->surface == nullptr)
         return;
     if (state == GHOSTTY_MOUSE_PRESS) {
+        SetFocus(s->hwnd);
         SetCapture(s->hwnd);
     } else {
         ReleaseCapture();
@@ -542,9 +864,8 @@ LRESULT CALLBACK surfaceWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpara
     }
 
     case WM_SIZE:
-        if (s->surface != nullptr) {
+        if (s->surface != nullptr)
             ghostty_surface_set_size(s->surface, LOWORD(lparam), HIWORD(lparam));
-        }
         return 0;
 
     case WM_SETFOCUS:
@@ -646,7 +967,6 @@ Surface* createSurface(App* app) {
 // Top-level window
 //----------------------------------------------------------------------------//
 
-// Draw the tab strip across the top of the window.
 void paintTabBar(App* app, HDC dc) {
     RECT client;
     GetClientRect(app->hwnd, &client);
@@ -667,8 +987,9 @@ void paintTabBar(App* app, HDC dc) {
                  reinterpret_cast<HBRUSH>(
                      (static_cast<size_t>(i) == app->active ? COLOR_WINDOW : COLOR_BTNFACE) + 1));
         FrameRect(dc, &tab, reinterpret_cast<HBRUSH>(COLOR_BTNSHADOW + 1));
-        const std::string& title = app->tabs[static_cast<size_t>(i)]->title;
-        const std::string label = title.empty() ? "Ghostty" : title;
+        Surface* focused = app->tabs[static_cast<size_t>(i)]->focused;
+        const std::string label =
+            (focused != nullptr && !focused->title.empty()) ? focused->title : "Ghostty";
         RECT text = tab;
         text.left += 8;
         DrawTextA(dc, label.c_str(), -1, &text,
@@ -798,9 +1119,15 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         DispatchMessageW(&msg);
     }
 
-    for (Surface* s : g_app.tabs) {
-        ghostty_surface_free(s->surface);
-        delete s;
+    for (Tab* tab : g_app.tabs) {
+        std::vector<Pane*> leaves;
+        collectLeaves(tab->root, leaves);
+        for (Pane* leaf : leaves) {
+            ghostty_surface_free(leaf->surface->surface);
+            delete leaf->surface;
+        }
+        freeTree(tab->root);
+        delete tab;
     }
     ghostty_app_free(g_app.app);
     return static_cast<int>(msg.wParam);
