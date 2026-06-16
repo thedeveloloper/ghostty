@@ -19,6 +19,7 @@ pub const Backend = enum {
         }
 
         if (target.os.tag.isDarwin()) return .metal;
+        if (target.os.tag == .windows) return .directx;
         return .opengl;
     }
 };
