@@ -39,8 +39,10 @@ pub inline fn renderPass(
     self: *const Self,
     attachments: []const RenderPass.Options.Attachment,
 ) RenderPass {
-    _ = self;
-    return RenderPass.begin(.{ .attachments = attachments });
+    return RenderPass.begin(.{
+        .context = self.renderer.api.context,
+        .attachments = attachments,
+    });
 }
 
 /// Complete this frame and present the target.

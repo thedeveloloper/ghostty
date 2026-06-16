@@ -53,9 +53,11 @@ blending: configpkg.Config.AlphaBlending,
 device: *api.ID3D11Device,
 context: *api.ID3D11DeviceContext,
 
-/// The swap chain bound to the host's HWND and the render target view for
-/// its back buffer.
+/// The swap chain bound to the host's HWND, its back buffer (kept so present
+/// can copy the final target into it), and the back buffer's render target
+/// view.
 swap_chain: *api.IDXGISwapChain,
+back_buffer: *api.ID3D11Resource,
 render_target: *api.ID3D11RenderTargetView,
 
 /// The most recently presented target, in case we need to present it again.
@@ -105,10 +107,10 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Direct3D11 {
     const sc = swap_chain orelse return error.D3D11CreateDeviceFailed;
     errdefer sc.release();
 
-    // Create the render target view for the swap chain's back buffer. The
-    // view holds its own reference, so we release our handle to the texture.
+    // Create the render target view for the swap chain's back buffer. We keep
+    // the back buffer handle so present can copy the final target into it.
     const back_buffer = try sc.getBuffer(0);
-    defer back_buffer.release();
+    errdefer back_buffer.release();
     const rtv = try dev.createRenderTargetView(back_buffer);
 
     return .{
@@ -117,12 +119,14 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Direct3D11 {
         .device = dev,
         .context = ctx,
         .swap_chain = sc,
+        .back_buffer = back_buffer,
         .render_target = rtv,
     };
 }
 
 pub fn deinit(self: *Direct3D11) void {
     self.render_target.release();
+    self.back_buffer.release();
     self.swap_chain.release();
     self.context.release();
     self.device.release();
@@ -159,17 +163,21 @@ pub fn surfaceSize(self: *const Direct3D11) !struct { width: u32, height: u32 } 
 
 /// Initialize a new render target which can be presented by this API.
 pub fn initTarget(self: *const Direct3D11, width: usize, height: usize) !Target {
-    _ = self;
-    return Target.init(.{ .width = width, .height = height });
+    return Target.init(.{
+        .device = self.device,
+        .width = width,
+        .height = height,
+        .format = .b8g8r8a8_unorm,
+    });
 }
 
 /// Present the provided target.
 pub fn present(self: *Direct3D11, target: Target) !void {
     self.last_target = target;
-    // Present with vsync. The frame is rendered directly into the swap
-    // chain's back buffer via `render_target`.
-    // TODO(windows): blit the provided `target` for the off-screen
-    // (custom shader) path; for now we present the back buffer directly.
+    // Copy the rendered target into the swap chain back buffer, then present.
+    // TODO(windows): handle resize via IDXGISwapChain::ResizeBuffers so the
+    // back buffer and target dimensions stay in sync.
+    self.context.copyResource(self.back_buffer, target.texture.resource());
     try self.swap_chain.present(1, 0);
 }
 

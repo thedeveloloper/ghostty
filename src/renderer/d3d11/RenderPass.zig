@@ -1,4 +1,9 @@
 //! Wrapper for handling render passes.
+//!
+//! Binding convention (must match the HLSL shaders): the uniform constant
+//! buffer is at register b0; structured `buffers` are SRVs at t0+; `textures`
+//! are SRVs at t8+; `samplers` are at s0+. Buffers and textures are bound to
+//! both the vertex and pixel stages.
 const Self = @This();
 
 const std = @import("std");
@@ -11,8 +16,13 @@ const Pipeline = @import("Pipeline.zig");
 
 const log = std.log.scoped(.directx);
 
+/// Base SRV register for textures, leaving t0..t7 for structured buffers.
+const texture_srv_base: u32 = 8;
+
 /// Options for beginning a render pass.
 pub const Options = struct {
+    context: *api.ID3D11DeviceContext,
+
     /// Color attachments for this render pass.
     attachments: []const Attachment,
 
@@ -29,8 +39,8 @@ pub const Options = struct {
 /// Describes a step in a render pass.
 pub const Step = struct {
     pipeline: Pipeline,
-    uniforms: ?*api.ID3D11Buffer = null,
-    buffers: []const ?*api.ID3D11Buffer = &.{},
+    uniforms: ?api.BoundBuffer = null,
+    buffers: []const ?api.BoundBuffer = &.{},
     textures: []const ?Texture = &.{},
     samplers: []const ?Sampler = &.{},
     draw: Draw,
@@ -43,23 +53,73 @@ pub const Step = struct {
     };
 };
 
-attachments: []const Options.Attachment,
+context: *api.ID3D11DeviceContext,
 
-step_number: usize = 0,
-
-/// Begin a render pass.
+/// Begin a render pass: bind the render target and viewport, and clear if
+/// requested.
 pub fn begin(opts: Options) Self {
-    return .{
-        .attachments = opts.attachments,
+    const ctx = opts.context;
+    const at = opts.attachments[0];
+
+    // Resolve the render target view and dimensions from the attachment.
+    const rtv: ?*api.ID3D11RenderTargetView, const dims: [2]usize = switch (at.target) {
+        .target => |t| .{ t.rtv, .{ t.width, t.height } },
+        // TODO(windows): rendering into a plain texture (custom shader
+        // intermediates) needs an RTV on the texture.
+        .texture => |t| .{ null, .{ t.width, t.height } },
     };
+
+    if (rtv) |target_view| {
+        ctx.omSetRenderTarget(target_view);
+        ctx.rsSetViewport(.{
+            .Width = @floatFromInt(dims[0]),
+            .Height = @floatFromInt(dims[1]),
+        });
+        if (at.clear_color) |c| ctx.clearRenderTargetView(target_view, c);
+    }
+
+    return .{ .context = ctx };
 }
 
 /// Add a step to this render pass.
 pub fn step(self: *Self, s: Step) void {
-    _ = self;
-    _ = s;
-    // TODO(windows): set the RTV/viewport, bind the pipeline, uniforms,
-    // buffers, textures and samplers, then issue the (instanced) draw.
+    if (s.draw.instance_count == 0) return;
+
+    const ctx = self.context;
+
+    // Shaders and pipeline state.
+    ctx.vsSetShader(s.pipeline.vertex_shader);
+    ctx.psSetShader(s.pipeline.pixel_shader);
+    ctx.omSetBlendState(s.pipeline.blend_state);
+    ctx.iaSetPrimitiveTopology(switch (s.draw.type) {
+        .triangle => .triangle_list,
+        .triangle_strip => .triangle_strip,
+    });
+
+    // Uniform constant buffer at b0.
+    if (s.uniforms) |u| {
+        ctx.vsSetConstantBuffer(0, u.buffer);
+        ctx.psSetConstantBuffer(0, u.buffer);
+    }
+
+    // Structured buffers as SRVs at t0+.
+    for (s.buffers, 0..) |maybe, i| if (maybe) |b| if (b.srv) |srv| {
+        ctx.vsSetShaderResource(@intCast(i), srv);
+        ctx.psSetShaderResource(@intCast(i), srv);
+    };
+
+    // Textures as SRVs at t8+.
+    for (s.textures, 0..) |maybe, j| if (maybe) |t| {
+        ctx.vsSetShaderResource(texture_srv_base + @as(u32, @intCast(j)), t.srv);
+        ctx.psSetShaderResource(texture_srv_base + @as(u32, @intCast(j)), t.srv);
+    };
+
+    // Samplers at s0+.
+    for (s.samplers, 0..) |maybe, j| if (maybe) |sampler| {
+        ctx.psSetSampler(@intCast(j), sampler.sampler);
+    };
+
+    ctx.drawInstanced(@intCast(s.draw.vertex_count), @intCast(s.draw.instance_count));
 }
 
 /// Complete this render pass. This struct can no longer be used afterward.

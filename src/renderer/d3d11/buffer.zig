@@ -24,8 +24,9 @@ pub fn Buffer(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        /// Underlying `ID3D11Buffer`.
-        buffer: *api.ID3D11Buffer,
+        /// The bound buffer (and its SRV, for structured buffers). This is
+        /// the handle the render pass binds.
+        buffer: api.BoundBuffer,
 
         /// Options this buffer was allocated with.
         opts: Options,
@@ -35,7 +36,7 @@ pub fn Buffer(comptime T: type) type {
 
         /// Initialize a buffer with the given length pre-allocated.
         pub fn init(opts: Options, len: usize) !Self {
-            const buffer = try opts.device.createBuffer(&bufferDesc(opts, len), null);
+            const buffer = try create(opts, len);
             return .{ .buffer = buffer, .opts = opts, .len = len };
         }
 
@@ -48,7 +49,8 @@ pub fn Buffer(comptime T: type) type {
         }
 
         pub fn deinit(self: Self) void {
-            self.buffer.release();
+            if (self.buffer.srv) |srv| srv.release();
+            self.buffer.buffer.release();
         }
 
         /// Sync the complete contents of the buffer, reallocating (to double
@@ -58,11 +60,12 @@ pub fn Buffer(comptime T: type) type {
             const bytes = data.len * @sizeOf(T);
             if (bytes == 0) return;
 
-            const mapped = try self.opts.context.map(self.buffer.resource(), 0, .write_discard);
+            const res = self.buffer.buffer.resource();
+            const mapped = try self.opts.context.map(res, 0, .write_discard);
             const dst: [*]u8 = @ptrCast(mapped.pData orelse return error.MapFailed);
             const src: [*]const u8 = @ptrCast(data.ptr);
             @memcpy(dst[0..bytes], src[0..bytes]);
-            self.opts.context.unmap(self.buffer.resource(), 0);
+            self.opts.context.unmap(res, 0);
         }
 
         /// Like `sync` but draws data from an array of ArrayLists. Returns the
@@ -76,7 +79,8 @@ pub fn Buffer(comptime T: type) type {
             if (total > self.len) try self.grow(total * 2);
             if (total == 0) return 0;
 
-            const mapped = try self.opts.context.map(self.buffer.resource(), 0, .write_discard);
+            const res = self.buffer.buffer.resource();
+            const mapped = try self.opts.context.map(res, 0, .write_discard);
             const dst: [*]u8 = @ptrCast(mapped.pData orelse return error.MapFailed);
             var i: usize = 0;
             for (lists) |list| {
@@ -85,16 +89,28 @@ pub fn Buffer(comptime T: type) type {
                 @memcpy(dst[i .. i + n], src[0..n]);
                 i += n;
             }
-            self.opts.context.unmap(self.buffer.resource(), 0);
+            self.opts.context.unmap(res, 0);
             return total;
         }
 
-        /// Reallocate the underlying buffer to hold at least `len` elements.
+        /// Reallocate the underlying buffer (and its SRV) to hold at least
+        /// `len` elements.
         fn grow(self: *Self, len: usize) !void {
-            const buffer = try self.opts.device.createBuffer(&bufferDesc(self.opts, len), null);
-            self.buffer.release();
+            const buffer = try create(self.opts, len);
+            self.deinit();
             self.buffer = buffer;
             self.len = len;
+        }
+
+        /// Create the buffer and, for structured buffers, its SRV.
+        fn create(opts: Options, len: usize) !api.BoundBuffer {
+            const buffer = try opts.device.createBuffer(&bufferDesc(opts, len), null);
+            errdefer buffer.release();
+            const srv: ?*api.ID3D11ShaderResourceView = if (opts.structured)
+                try opts.device.createBufferSRV(buffer, @intCast(len))
+            else
+                null;
+            return .{ .buffer = buffer, .srv = srv };
         }
 
         fn bufferDesc(opts: Options, len: usize) api.BufferDesc {

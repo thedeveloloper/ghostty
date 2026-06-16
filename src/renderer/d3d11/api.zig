@@ -193,6 +193,43 @@ pub const MappedSubresource = extern struct {
     DepthPitch: UINT = 0,
 };
 
+pub const Viewport = extern struct {
+    TopLeftX: FLOAT = 0,
+    TopLeftY: FLOAT = 0,
+    Width: FLOAT,
+    Height: FLOAT,
+    MinDepth: FLOAT = 0,
+    MaxDepth: FLOAT = 1,
+};
+
+pub const PrimitiveTopology = enum(c_uint) {
+    triangle_list = 4,
+    triangle_strip = 5,
+};
+
+/// `D3D11_SRV_DIMENSION_BUFFER`.
+pub const SRV_DIMENSION_BUFFER: c_uint = 1;
+
+/// A shader resource view descriptor. The trailing fields are a union in
+/// the C API, sized for its largest member (4 UINTs); for a structured
+/// buffer we only use the first two (FirstElement, NumElements).
+pub const ShaderResourceViewDesc = extern struct {
+    Format: Format,
+    ViewDimension: c_uint,
+    u0: u32 = 0,
+    u1: u32 = 0,
+    u2: u32 = 0,
+    u3: u32 = 0,
+};
+
+/// A GPU buffer together with an optional shader resource view, present for
+/// structured buffers that are read in the shaders. This is the handle the
+/// render pass binds.
+pub const BoundBuffer = struct {
+    buffer: *ID3D11Buffer,
+    srv: ?*ID3D11ShaderResourceView = null,
+};
+
 // -- COM interfaces ------------------------------------------------------
 
 /// Base resource interface; textures and buffers can be cast to this to be
@@ -387,6 +424,25 @@ pub const ID3D11Device = extern struct {
         return out orelse error.CreateShaderResourceViewFailed;
     }
 
+    /// Create a shader resource view over a structured buffer so it can be
+    /// read as a `StructuredBuffer<T>` in the shaders.
+    pub inline fn createBufferSRV(
+        self: *ID3D11Device,
+        buffer: *ID3D11Buffer,
+        num_elements: u32,
+    ) !*ID3D11ShaderResourceView {
+        var desc: ShaderResourceViewDesc = .{
+            .Format = .unknown,
+            .ViewDimension = SRV_DIMENSION_BUFFER,
+            .u0 = 0, // FirstElement
+            .u1 = num_elements, // NumElements
+        };
+        var out: ?*ID3D11ShaderResourceView = null;
+        const hr = self.vtable.CreateShaderResourceView(self, buffer.resource(), &desc, &out);
+        if (FAILED(hr)) return error.CreateShaderResourceViewFailed;
+        return out orelse error.CreateShaderResourceViewFailed;
+    }
+
     pub inline fn createRenderTargetView(
         self: *ID3D11Device,
         res: *ID3D11Resource,
@@ -443,11 +499,11 @@ pub const ID3D11DeviceContext = extern struct {
         GetPrivateData: *const anyopaque,
         SetPrivateData: *const anyopaque,
         SetPrivateDataInterface: *const anyopaque,
-        VSSetConstantBuffers: *const anyopaque,
-        PSSetShaderResources: *const anyopaque,
-        PSSetShader: *const anyopaque,
-        PSSetSamplers: *const anyopaque,
-        VSSetShader: *const anyopaque,
+        VSSetConstantBuffers: *const fn (*ID3D11DeviceContext, UINT, UINT, ?[*]const ?*ID3D11Buffer) callconv(.winapi) void,
+        PSSetShaderResources: *const fn (*ID3D11DeviceContext, UINT, UINT, ?[*]const ?*ID3D11ShaderResourceView) callconv(.winapi) void,
+        PSSetShader: *const fn (*ID3D11DeviceContext, ?*ID3D11PixelShader, ?*const anyopaque, UINT) callconv(.winapi) void,
+        PSSetSamplers: *const fn (*ID3D11DeviceContext, UINT, UINT, ?[*]const ?*ID3D11SamplerState) callconv(.winapi) void,
+        VSSetShader: *const fn (*ID3D11DeviceContext, ?*ID3D11VertexShader, ?*const anyopaque, UINT) callconv(.winapi) void,
         DrawIndexed: *const anyopaque,
         Draw: *const anyopaque,
         Map: *const fn (
@@ -459,16 +515,16 @@ pub const ID3D11DeviceContext = extern struct {
             *MappedSubresource,
         ) callconv(.winapi) HRESULT,
         Unmap: *const fn (*ID3D11DeviceContext, *ID3D11Resource, UINT) callconv(.winapi) void,
-        PSSetConstantBuffers: *const anyopaque,
+        PSSetConstantBuffers: *const fn (*ID3D11DeviceContext, UINT, UINT, ?[*]const ?*ID3D11Buffer) callconv(.winapi) void,
         IASetInputLayout: *const anyopaque,
         IASetVertexBuffers: *const anyopaque,
         IASetIndexBuffer: *const anyopaque,
         DrawIndexedInstanced: *const anyopaque,
-        DrawInstanced: *const anyopaque,
+        DrawInstanced: *const fn (*ID3D11DeviceContext, UINT, UINT, UINT, UINT) callconv(.winapi) void,
         GSSetConstantBuffers: *const anyopaque,
         GSSetShader: *const anyopaque,
-        IASetPrimitiveTopology: *const anyopaque,
-        VSSetShaderResources: *const anyopaque,
+        IASetPrimitiveTopology: *const fn (*ID3D11DeviceContext, c_uint) callconv(.winapi) void,
+        VSSetShaderResources: *const fn (*ID3D11DeviceContext, UINT, UINT, ?[*]const ?*ID3D11ShaderResourceView) callconv(.winapi) void,
         VSSetSamplers: *const anyopaque,
         Begin: *const anyopaque,
         End: *const anyopaque,
@@ -476,9 +532,9 @@ pub const ID3D11DeviceContext = extern struct {
         SetPredication: *const anyopaque,
         GSSetShaderResources: *const anyopaque,
         GSSetSamplers: *const anyopaque,
-        OMSetRenderTargets: *const anyopaque,
+        OMSetRenderTargets: *const fn (*ID3D11DeviceContext, UINT, ?[*]const ?*ID3D11RenderTargetView, ?*anyopaque) callconv(.winapi) void,
         OMSetRenderTargetsAndUnorderedAccessViews: *const anyopaque,
-        OMSetBlendState: *const anyopaque,
+        OMSetBlendState: *const fn (*ID3D11DeviceContext, ?*ID3D11BlendState, ?*const [4]f32, UINT) callconv(.winapi) void,
         OMSetDepthStencilState: *const anyopaque,
         SOSetTargets: *const anyopaque,
         DrawAuto: *const anyopaque,
@@ -487,10 +543,10 @@ pub const ID3D11DeviceContext = extern struct {
         Dispatch: *const anyopaque,
         DispatchIndirect: *const anyopaque,
         RSSetState: *const anyopaque,
-        RSSetViewports: *const anyopaque,
+        RSSetViewports: *const fn (*ID3D11DeviceContext, UINT, ?[*]const Viewport) callconv(.winapi) void,
         RSSetScissorRects: *const anyopaque,
         CopySubresourceRegion: *const anyopaque,
-        CopyResource: *const anyopaque,
+        CopyResource: *const fn (*ID3D11DeviceContext, *ID3D11Resource, *ID3D11Resource) callconv(.winapi) void,
         UpdateSubresource: *const fn (
             *ID3D11DeviceContext,
             *ID3D11Resource,
@@ -499,6 +555,12 @@ pub const ID3D11DeviceContext = extern struct {
             *const anyopaque,
             UINT,
             UINT,
+        ) callconv(.winapi) void,
+        CopyStructureCount: *const anyopaque,
+        ClearRenderTargetView: *const fn (
+            *ID3D11DeviceContext,
+            *ID3D11RenderTargetView,
+            *const [4]f32,
         ) callconv(.winapi) void,
     };
 
@@ -532,6 +594,62 @@ pub const ID3D11DeviceContext = extern struct {
     ) void {
         // A null box updates the entire resource.
         self.vtable.UpdateSubresource(self, res, subresource, null, data, row_pitch, depth_pitch);
+    }
+
+    pub inline fn vsSetShader(self: *ID3D11DeviceContext, shader: *ID3D11VertexShader) void {
+        self.vtable.VSSetShader(self, shader, null, 0);
+    }
+
+    pub inline fn psSetShader(self: *ID3D11DeviceContext, shader: *ID3D11PixelShader) void {
+        self.vtable.PSSetShader(self, shader, null, 0);
+    }
+
+    pub inline fn vsSetConstantBuffer(self: *ID3D11DeviceContext, slot: UINT, buffer: *ID3D11Buffer) void {
+        self.vtable.VSSetConstantBuffers(self, slot, 1, &[_]?*ID3D11Buffer{buffer});
+    }
+
+    pub inline fn psSetConstantBuffer(self: *ID3D11DeviceContext, slot: UINT, buffer: *ID3D11Buffer) void {
+        self.vtable.PSSetConstantBuffers(self, slot, 1, &[_]?*ID3D11Buffer{buffer});
+    }
+
+    pub inline fn vsSetShaderResource(self: *ID3D11DeviceContext, slot: UINT, srv: *ID3D11ShaderResourceView) void {
+        self.vtable.VSSetShaderResources(self, slot, 1, &[_]?*ID3D11ShaderResourceView{srv});
+    }
+
+    pub inline fn psSetShaderResource(self: *ID3D11DeviceContext, slot: UINT, srv: *ID3D11ShaderResourceView) void {
+        self.vtable.PSSetShaderResources(self, slot, 1, &[_]?*ID3D11ShaderResourceView{srv});
+    }
+
+    pub inline fn psSetSampler(self: *ID3D11DeviceContext, slot: UINT, sampler: *ID3D11SamplerState) void {
+        self.vtable.PSSetSamplers(self, slot, 1, &[_]?*ID3D11SamplerState{sampler});
+    }
+
+    pub inline fn iaSetPrimitiveTopology(self: *ID3D11DeviceContext, topology: PrimitiveTopology) void {
+        self.vtable.IASetPrimitiveTopology(self, @intFromEnum(topology));
+    }
+
+    pub inline fn rsSetViewport(self: *ID3D11DeviceContext, viewport: Viewport) void {
+        self.vtable.RSSetViewports(self, 1, &[_]Viewport{viewport});
+    }
+
+    pub inline fn omSetRenderTarget(self: *ID3D11DeviceContext, rtv: *ID3D11RenderTargetView) void {
+        self.vtable.OMSetRenderTargets(self, 1, &[_]?*ID3D11RenderTargetView{rtv}, null);
+    }
+
+    pub inline fn omSetBlendState(self: *ID3D11DeviceContext, blend: ?*ID3D11BlendState) void {
+        self.vtable.OMSetBlendState(self, blend, null, 0xffffffff);
+    }
+
+    pub inline fn clearRenderTargetView(self: *ID3D11DeviceContext, rtv: *ID3D11RenderTargetView, color: [4]f32) void {
+        self.vtable.ClearRenderTargetView(self, rtv, &color);
+    }
+
+    pub inline fn drawInstanced(self: *ID3D11DeviceContext, vertex_count: UINT, instance_count: UINT) void {
+        self.vtable.DrawInstanced(self, vertex_count, instance_count, 0, 0);
+    }
+
+    pub inline fn copyResource(self: *ID3D11DeviceContext, dst: *ID3D11Resource, src: *ID3D11Resource) void {
+        self.vtable.CopyResource(self, dst, src);
     }
 };
 
