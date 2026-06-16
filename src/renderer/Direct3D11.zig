@@ -178,29 +178,58 @@ pub fn presentLastTarget(self: *Direct3D11) !void {
     if (self.last_target) |target| try self.present(target);
 }
 
-/// Returns the options to use when constructing buffers.
+/// Returns the options to use when constructing vertex buffers.
 pub inline fn bufferOptions(self: Direct3D11) bufferpkg.Options {
-    _ = self;
-    return .{};
+    return .{
+        .device = self.device,
+        .context = self.context,
+        .bind = api.BIND_VERTEX_BUFFER,
+    };
 }
 
-pub const instanceBufferOptions = bufferOptions;
-pub const uniformBufferOptions = bufferOptions;
-pub const fgBufferOptions = bufferOptions;
-pub const bgBufferOptions = bufferOptions;
-pub const imageBufferOptions = bufferOptions;
-pub const bgImageBufferOptions = bufferOptions;
+/// Returns the options to use when constructing the uniform constant buffer.
+pub inline fn uniformBufferOptions(self: Direct3D11) bufferpkg.Options {
+    return .{
+        .device = self.device,
+        .context = self.context,
+        .bind = api.BIND_CONSTANT_BUFFER,
+    };
+}
+
+/// Returns the options for per-instance cell/image data, read as structured
+/// buffers (`StructuredBuffer<T>`) in the shaders.
+pub inline fn structuredBufferOptions(self: Direct3D11) bufferpkg.Options {
+    return .{
+        .device = self.device,
+        .context = self.context,
+        .bind = api.BIND_SHADER_RESOURCE,
+        .structured = true,
+    };
+}
+
+pub const instanceBufferOptions = structuredBufferOptions;
+pub const fgBufferOptions = structuredBufferOptions;
+pub const bgBufferOptions = structuredBufferOptions;
+pub const imageBufferOptions = structuredBufferOptions;
+pub const bgImageBufferOptions = structuredBufferOptions;
 
 /// Returns the options to use when constructing textures.
 pub inline fn textureOptions(self: Direct3D11) Texture.Options {
-    _ = self;
-    return .{};
+    return .{
+        .device = self.device,
+        .context = self.context,
+        .format = .b8g8r8a8_unorm,
+    };
 }
 
 /// Returns the options to use when constructing samplers.
 pub inline fn samplerOptions(self: Direct3D11) Sampler.Options {
-    _ = self;
-    return .{};
+    return .{
+        .device = self.device,
+        .filter = .min_mag_mip_linear,
+        .address_u = .clamp,
+        .address_v = .clamp,
+    };
 }
 
 /// Pixel format for image texture options.
@@ -219,10 +248,15 @@ pub inline fn imageTextureOptions(
     format: ImageTextureFormat,
     srgb: bool,
 ) Texture.Options {
-    _ = self;
-    _ = format;
-    _ = srgb;
-    return .{};
+    return .{
+        .device = self.device,
+        .context = self.context,
+        .format = switch (format) {
+            .gray => .r8_unorm,
+            .rgba => if (srgb) .r8g8b8a8_unorm_srgb else .r8g8b8a8_unorm,
+            .bgra => if (srgb) .b8g8r8a8_unorm_srgb else .b8g8r8a8_unorm,
+        },
+    };
 }
 
 /// Initializes a Texture suitable for the provided font atlas.
@@ -230,10 +264,22 @@ pub fn initAtlasTexture(
     self: *const Direct3D11,
     atlas: *const font.Atlas,
 ) Texture.Error!Texture {
-    _ = self;
-    _ = atlas;
-    // TODO(windows): create an ID3D11Texture2D + SRV from the atlas data.
-    return error.Unimplemented;
+    const format: api.Format = switch (atlas.format) {
+        .grayscale => .r8_unorm,
+        .bgra => .b8g8r8a8_unorm,
+        else => @panic("unsupported atlas format for Direct3D texture"),
+    };
+
+    return try Texture.init(
+        .{
+            .device = self.device,
+            .context = self.context,
+            .format = format,
+        },
+        atlas.size,
+        atlas.size,
+        atlas.data,
+    );
 }
 
 /// Begin a frame.

@@ -29,8 +29,8 @@ pub const Options = struct {
 /// Describes a step in a render pass.
 pub const Step = struct {
     pipeline: Pipeline,
-    uniforms: ?api.Buffer = null,
-    buffers: []const ?api.Buffer = &.{},
+    uniforms: ?*api.ID3D11Buffer = null,
+    buffers: []const ?*api.ID3D11Buffer = &.{},
     textures: []const ?Texture = &.{},
     samplers: []const ?Sampler = &.{},
     draw: Draw,
