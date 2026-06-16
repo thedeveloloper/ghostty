@@ -1,35 +1,43 @@
 // Minimal native Windows host for Ghostty.
 //
 // This embeds libghostty through its C API (include/ghostty.h), the same way
-// the macOS app embeds it through Swift. It opens a single window, creates a
-// terminal surface bound to the window's HWND, drives the libghostty event
-// loop, and translates Win32 keyboard/mouse/clipboard events into the core's
-// input API. The Direct3D 11 renderer inside libghostty draws into the HWND.
+// the macOS app embeds it through Swift. The top-level window owns a tab strip
+// and routes events; each terminal surface lives in its own child window (one
+// surface <-> one HWND <-> one Direct3D swap chain). Keyboard, mouse, and
+// clipboard input are translated to the core's input API.
 //
-// Out of scope for now: tabs/splits, native chrome, settings, and full IME
-// composition (basic typing works via ToUnicode; IME preedit is a follow-up).
+// Out of scope for now: split panes within a tab, full IME composition, native
+// settings UI, and desktop-notification toasts.
 
 #include <windows.h>
 #include <windowsx.h>
 
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "ghostty.h"
 
 namespace {
 
-// State for our single window. libghostty calls back into us with the
-// `userdata` pointer we register, which points at this.
-struct Host {
-    ghostty_app_t app = nullptr;
-    ghostty_surface_t surface = nullptr;
+// One terminal surface, hosted in a child window of the top-level window.
+struct Surface {
     HWND hwnd = nullptr;
+    ghostty_surface_t surface = nullptr;
+    std::string title;
 
-    // Current mouse cursor and whether it should be shown, applied in
-    // WM_SETCURSOR (Windows resets the cursor on each one).
+    // Current cursor and visibility, applied in WM_SETCURSOR.
     HCURSOR cursor = nullptr;
     bool cursor_visible = true;
+};
+
+// The application: one libghostty app, a top-level window, and a list of tabs
+// (each tab is currently a single surface; split panes come later).
+struct App {
+    ghostty_app_t app = nullptr;
+    HWND hwnd = nullptr;
+    std::vector<Surface*> tabs;
+    size_t active = 0;
 
     // Saved window state for toggling borderless fullscreen.
     bool fullscreen = false;
@@ -37,17 +45,23 @@ struct Host {
     LONG_PTR prev_style = 0;
 };
 
-Host g_host;
+App g_app;
 
-// Posted to the window to ask the main thread to tick the libghostty loop.
 constexpr UINT WM_GHOSTTY_WAKEUP = WM_USER + 1;
+const wchar_t* kSurfaceClass = L"GhosttySurface";
+const wchar_t* kWindowClass = L"GhosttyWindow";
 
 double dpiScale(HWND hwnd) {
     const UINT dpi = GetDpiForWindow(hwnd);
     return (dpi == 0 ? 96.0 : static_cast<double>(dpi)) / 96.0;
 }
 
-// Current keyboard modifier state as a ghostty mods mask.
+int tabBarHeight(HWND hwnd) { return static_cast<int>(28.0 * dpiScale(hwnd)); }
+
+//----------------------------------------------------------------------------//
+// Input helpers
+//----------------------------------------------------------------------------//
+
 ghostty_input_mods_e currentMods() {
     int mods = GHOSTTY_MODS_NONE;
     if (GetKeyState(VK_SHIFT) & 0x8000)
@@ -71,29 +85,14 @@ ghostty_input_mods_e currentMods() {
     return static_cast<ghostty_input_mods_e>(mods);
 }
 
-// The Windows scan code, which is what the core's keycode table is keyed on
-// (Chromium's "win" column). Extended keys get the 0xE000 prefix.
+// The Windows scan code keys the core's keycode table (Chromium's "win"
+// column); extended keys get the 0xE000 prefix.
 uint32_t scancodeFromLParam(LPARAM lparam) {
     const uint32_t sc = static_cast<uint32_t>((lparam >> 16) & 0xFF);
     const bool extended = (lparam & (1 << 24)) != 0;
     return extended ? (0xE000u | sc) : sc;
 }
 
-//----------------------------------------------------------------------------//
-// libghostty runtime callbacks
-//----------------------------------------------------------------------------//
-
-// Called (possibly from the renderer thread) when the core needs the host to
-// advance its event loop. We post a message so the tick happens on the main
-// thread that owns the window.
-void wakeupCb(void* userdata) {
-    auto* host = static_cast<Host*>(userdata);
-    if (host != nullptr && host->hwnd != nullptr) {
-        PostMessageW(host->hwnd, WM_GHOSTTY_WAKEUP, 0, 0);
-    }
-}
-
-// Map a ghostty mouse shape to a standard Win32 cursor.
 LPCWSTR mouseShapeCursor(ghostty_action_mouse_shape_e shape) {
     switch (shape) {
     case GHOSTTY_MOUSE_SHAPE_TEXT:
@@ -138,33 +137,105 @@ LPCWSTR mouseShapeCursor(ghostty_action_mouse_shape_e shape) {
     }
 }
 
-// Toggle borderless fullscreen, saving and restoring the window style and
-// placement.
-void toggleFullscreen(Host* host) {
-    HWND hwnd = host->hwnd;
-    if (!host->fullscreen) {
-        host->prev_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        GetWindowPlacement(hwnd, &host->prev_placement);
+//----------------------------------------------------------------------------//
+// Tab management
+//----------------------------------------------------------------------------//
+
+Surface* activeSurface(App* app) { return app->tabs.empty() ? nullptr : app->tabs[app->active]; }
+
+// Place the active surface's child window over the content area (below the tab
+// strip) and hide the others.
+void layoutTabs(App* app) {
+    RECT client;
+    GetClientRect(app->hwnd, &client);
+    const int bar = tabBarHeight(app->hwnd);
+    for (size_t i = 0; i < app->tabs.size(); i++) {
+        HWND child = app->tabs[i]->hwnd;
+        if (i == app->active) {
+            SetWindowPos(child, nullptr, client.left, client.top + bar, client.right - client.left,
+                         client.bottom - client.top - bar, SWP_NOZORDER | SWP_SHOWWINDOW);
+        } else {
+            ShowWindow(child, SW_HIDE);
+        }
+    }
+    InvalidateRect(app->hwnd, nullptr, FALSE);
+}
+
+void setActiveTab(App* app, size_t index) {
+    if (index >= app->tabs.size())
+        return;
+    app->active = index;
+    layoutTabs(app);
+    Surface* s = activeSurface(app);
+    if (s != nullptr) {
+        SetFocus(s->hwnd);
+        SetWindowTextA(app->hwnd, s->title.empty() ? "Ghostty" : s->title.c_str());
+    }
+}
+
+Surface* createSurface(App* app); // forward declaration
+
+void addTab(App* app) {
+    Surface* s = createSurface(app);
+    if (s == nullptr)
+        return;
+    app->tabs.push_back(s);
+    setActiveTab(app, app->tabs.size() - 1);
+}
+
+void closeTabAt(App* app, size_t index) {
+    if (index >= app->tabs.size())
+        return;
+    Surface* s = app->tabs[index];
+    ghostty_surface_free(s->surface);
+    DestroyWindow(s->hwnd);
+    delete s;
+    app->tabs.erase(app->tabs.begin() + static_cast<long>(index));
+
+    if (app->tabs.empty()) {
+        PostQuitMessage(0);
+        return;
+    }
+    setActiveTab(app, app->active >= app->tabs.size() ? app->tabs.size() - 1 : app->active);
+}
+
+// Find the tab index hosting the given libghostty surface, or -1.
+ptrdiff_t indexOfSurface(App* app, ghostty_surface_t surface) {
+    for (size_t i = 0; i < app->tabs.size(); i++) {
+        if (app->tabs[i]->surface == surface)
+            return static_cast<ptrdiff_t>(i);
+    }
+    return -1;
+}
+
+//----------------------------------------------------------------------------//
+// Window-level actions
+//----------------------------------------------------------------------------//
+
+void toggleFullscreen(App* app) {
+    HWND hwnd = app->hwnd;
+    if (!app->fullscreen) {
+        app->prev_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        GetWindowPlacement(hwnd, &app->prev_placement);
         MONITORINFO mi = {sizeof(mi)};
         if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
             SetWindowLongPtrW(hwnd, GWL_STYLE,
-                              host->prev_style & ~static_cast<LONG_PTR>(WS_OVERLAPPEDWINDOW));
+                              app->prev_style & ~static_cast<LONG_PTR>(WS_OVERLAPPEDWINDOW));
             SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
                          mi.rcMonitor.right - mi.rcMonitor.left,
                          mi.rcMonitor.bottom - mi.rcMonitor.top,
                          SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-            host->fullscreen = true;
+            app->fullscreen = true;
         }
     } else {
-        SetWindowLongPtrW(hwnd, GWL_STYLE, host->prev_style);
-        SetWindowPlacement(hwnd, &host->prev_placement);
+        SetWindowLongPtrW(hwnd, GWL_STYLE, app->prev_style);
+        SetWindowPlacement(hwnd, &app->prev_placement);
         SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-        host->fullscreen = false;
+        app->fullscreen = false;
     }
 }
 
-// Open a (url, len) pair with the system default handler.
 void openUrl(const char* url, uintptr_t len) {
     if (url == nullptr || len == 0)
         return;
@@ -176,64 +247,122 @@ void openUrl(const char* url, uintptr_t len) {
     ShellExecuteW(nullptr, L"open", wide.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
-bool actionCb(ghostty_app_t app, ghostty_target_s target, ghostty_action_s action) {
-    (void)app;
-    (void)target;
-    Host* host = &g_host;
-    if (host->hwnd == nullptr)
+//----------------------------------------------------------------------------//
+// libghostty runtime callbacks
+//----------------------------------------------------------------------------//
+
+void wakeupCb(void* userdata) {
+    auto* app = static_cast<App*>(userdata);
+    if (app != nullptr && app->hwnd != nullptr)
+        PostMessageW(app->hwnd, WM_GHOSTTY_WAKEUP, 0, 0);
+}
+
+bool actionCb(ghostty_app_t app_handle, ghostty_target_s target, ghostty_action_s action) {
+    (void)app_handle;
+    App* app = &g_app;
+    if (app->hwnd == nullptr)
         return false;
+
+    // The surface this action targets, if any.
+    Surface* surface = nullptr;
+    if (target.tag == GHOSTTY_TARGET_SURFACE) {
+        const ptrdiff_t i = indexOfSurface(app, target.target.surface);
+        if (i >= 0)
+            surface = app->tabs[static_cast<size_t>(i)];
+    }
+    if (surface == nullptr)
+        surface = activeSurface(app);
 
     switch (action.tag) {
     case GHOSTTY_ACTION_RENDER:
-        InvalidateRect(host->hwnd, nullptr, FALSE);
+        if (surface != nullptr)
+            InvalidateRect(surface->hwnd, nullptr, FALSE);
         return true;
 
     case GHOSTTY_ACTION_SET_TITLE:
-        if (action.action.set_title.title != nullptr) {
-            SetWindowTextA(host->hwnd, action.action.set_title.title);
+        if (surface != nullptr && action.action.set_title.title != nullptr) {
+            surface->title = action.action.set_title.title;
+            InvalidateRect(app->hwnd, nullptr, FALSE);
+            if (surface == activeSurface(app)) {
+                SetWindowTextA(app->hwnd, surface->title.c_str());
+            }
         }
         return true;
 
     case GHOSTTY_ACTION_MOUSE_SHAPE:
-        host->cursor = LoadCursorW(nullptr, mouseShapeCursor(action.action.mouse_shape));
-        SetCursor(host->cursor);
+        if (surface != nullptr) {
+            surface->cursor = LoadCursorW(nullptr, mouseShapeCursor(action.action.mouse_shape));
+            SetCursor(surface->cursor);
+        }
         return true;
 
     case GHOSTTY_ACTION_MOUSE_VISIBILITY:
-        host->cursor_visible = action.action.mouse_visibility == GHOSTTY_MOUSE_VISIBLE;
-        SetCursor(host->cursor_visible ? host->cursor : nullptr);
+        if (surface != nullptr) {
+            surface->cursor_visible = action.action.mouse_visibility == GHOSTTY_MOUSE_VISIBLE;
+            SetCursor(surface->cursor_visible ? surface->cursor : nullptr);
+        }
         return true;
 
+    case GHOSTTY_ACTION_NEW_TAB:
+        addTab(app);
+        return true;
+
+    case GHOSTTY_ACTION_CLOSE_TAB:
+        if (surface != nullptr) {
+            const ptrdiff_t i = indexOfSurface(app, surface->surface);
+            if (i >= 0)
+                closeTabAt(app, static_cast<size_t>(i));
+        }
+        return true;
+
+    case GHOSTTY_ACTION_GOTO_TAB: {
+        const int n = static_cast<int>(app->tabs.size());
+        if (n == 0)
+            return true;
+        const int v = static_cast<int>(action.action.goto_tab);
+        size_t target_index = app->active;
+        if (v == GHOSTTY_GOTO_TAB_PREVIOUS) {
+            target_index = (app->active + static_cast<size_t>(n) - 1) % static_cast<size_t>(n);
+        } else if (v == GHOSTTY_GOTO_TAB_NEXT) {
+            target_index = (app->active + 1) % static_cast<size_t>(n);
+        } else if (v == GHOSTTY_GOTO_TAB_LAST) {
+            target_index = static_cast<size_t>(n - 1);
+        } else if (v >= 0 && v < n) {
+            target_index = static_cast<size_t>(v);
+        }
+        setActiveTab(app, target_index);
+        return true;
+    }
+
     case GHOSTTY_ACTION_TOGGLE_FULLSCREEN:
-        toggleFullscreen(host);
+        toggleFullscreen(app);
         return true;
 
     case GHOSTTY_ACTION_TOGGLE_MAXIMIZE:
-        ShowWindow(host->hwnd, IsZoomed(host->hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+        ShowWindow(app->hwnd, IsZoomed(app->hwnd) ? SW_RESTORE : SW_MAXIMIZE);
         return true;
 
     case GHOSTTY_ACTION_TOGGLE_WINDOW_DECORATIONS: {
-        const LONG_PTR style = GetWindowLongPtrW(host->hwnd, GWL_STYLE);
-        SetWindowLongPtrW(host->hwnd, GWL_STYLE,
-                          style ^ static_cast<LONG_PTR>(WS_OVERLAPPEDWINDOW));
-        SetWindowPos(host->hwnd, nullptr, 0, 0, 0, 0,
+        const LONG_PTR style = GetWindowLongPtrW(app->hwnd, GWL_STYLE);
+        SetWindowLongPtrW(app->hwnd, GWL_STYLE, style ^ static_cast<LONG_PTR>(WS_OVERLAPPEDWINDOW));
+        SetWindowPos(app->hwnd, nullptr, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
         return true;
     }
 
     case GHOSTTY_ACTION_INITIAL_SIZE: {
         RECT r = {0, 0, static_cast<LONG>(action.action.initial_size.width),
-                  static_cast<LONG>(action.action.initial_size.height)};
-        const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(host->hwnd, GWL_STYLE));
-        AdjustWindowRectExForDpi(&r, style, FALSE, 0, GetDpiForWindow(host->hwnd));
-        SetWindowPos(host->hwnd, nullptr, 0, 0, r.right - r.left, r.bottom - r.top,
+                  static_cast<LONG>(action.action.initial_size.height + tabBarHeight(app->hwnd))};
+        const DWORD style = static_cast<DWORD>(GetWindowLongPtrW(app->hwnd, GWL_STYLE));
+        AdjustWindowRectExForDpi(&r, style, FALSE, 0, GetDpiForWindow(app->hwnd));
+        SetWindowPos(app->hwnd, nullptr, 0, 0, r.right - r.left, r.bottom - r.top,
                      SWP_NOMOVE | SWP_NOZORDER);
         return true;
     }
 
     case GHOSTTY_ACTION_PRESENT_TERMINAL:
-        ShowWindow(host->hwnd, SW_RESTORE);
-        SetForegroundWindow(host->hwnd);
+        ShowWindow(app->hwnd, SW_RESTORE);
+        SetForegroundWindow(app->hwnd);
         return true;
 
     case GHOSTTY_ACTION_RING_BELL:
@@ -249,23 +378,21 @@ bool actionCb(ghostty_app_t app, ghostty_target_s target, ghostty_action_s actio
         PostQuitMessage(0);
         return true;
 
-    // TODO(windows): NEW_WINDOW/NEW_TAB/CLOSE_TAB/NEW_SPLIT require managing
-    // multiple surfaces and a tab/split UI, which this single-window host does
-    // not do yet. Desktop notifications also need a toast implementation.
+    // TODO(windows): split panes (NEW_SPLIT/GOTO_SPLIT/...) and desktop
+    // notification toasts are not implemented yet.
     default:
         return false;
     }
 }
 
-// Read the standard clipboard as UTF-8 and hand it back to the core.
 bool readClipboardCb(void* userdata, ghostty_clipboard_e location, void* state) {
     (void)location;
-    auto* host = static_cast<Host*>(userdata);
-    if (host == nullptr || host->surface == nullptr)
+    auto* surface = static_cast<Surface*>(userdata);
+    if (surface == nullptr || surface->surface == nullptr)
         return false;
 
     std::string utf8;
-    if (OpenClipboard(host->hwnd)) {
+    if (OpenClipboard(surface->hwnd)) {
         HANDLE handle = GetClipboardData(CF_UNICODETEXT);
         if (handle != nullptr) {
             const wchar_t* wide = static_cast<const wchar_t*>(GlobalLock(handle));
@@ -282,7 +409,7 @@ bool readClipboardCb(void* userdata, ghostty_clipboard_e location, void* state) 
         CloseClipboard();
     }
 
-    ghostty_surface_complete_clipboard_request(host->surface, utf8.c_str(), state, true);
+    ghostty_surface_complete_clipboard_request(surface->surface, utf8.c_str(), state, true);
     return true;
 }
 
@@ -294,13 +421,12 @@ void confirmReadClipboardCb(void* userdata, const char* str, void* state,
     (void)request;
 }
 
-// Write the first text content to the standard clipboard as UTF-16.
 void writeClipboardCb(void* userdata, ghostty_clipboard_e location,
                       const ghostty_clipboard_content_s* content, size_t len, bool confirm) {
     (void)location;
     (void)confirm;
-    auto* host = static_cast<Host*>(userdata);
-    if (host == nullptr || content == nullptr || len == 0)
+    auto* surface = static_cast<Surface*>(userdata);
+    if (surface == nullptr || content == nullptr || len == 0)
         return;
 
     const char* text = nullptr;
@@ -318,7 +444,7 @@ void writeClipboardCb(void* userdata, ghostty_clipboard_e location,
     const int wn = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
     if (wn <= 0)
         return;
-    if (!OpenClipboard(host->hwnd))
+    if (!OpenClipboard(surface->hwnd))
         return;
     EmptyClipboard();
     HGLOBAL global = GlobalAlloc(GMEM_MOVEABLE, static_cast<size_t>(wn) * sizeof(wchar_t));
@@ -332,17 +458,21 @@ void writeClipboardCb(void* userdata, ghostty_clipboard_e location,
 }
 
 void closeSurfaceCb(void* userdata, bool process_alive) {
-    (void)userdata;
     (void)process_alive;
-    PostQuitMessage(0);
+    auto* surface = static_cast<Surface*>(userdata);
+    if (surface == nullptr)
+        return;
+    const ptrdiff_t i = indexOfSurface(&g_app, surface->surface);
+    if (i >= 0)
+        closeTabAt(&g_app, static_cast<size_t>(i));
 }
 
 //----------------------------------------------------------------------------//
-// Input
+// Per-surface child window
 //----------------------------------------------------------------------------//
 
-void handleKey(Host* host, UINT msg, WPARAM wparam, LPARAM lparam) {
-    if (host->surface == nullptr)
+void handleKey(Surface* s, UINT msg, WPARAM wparam, LPARAM lparam) {
+    if (s->surface == nullptr)
         return;
 
     const bool down = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN);
@@ -356,8 +486,6 @@ void handleKey(Host* host, UINT msg, WPARAM wparam, LPARAM lparam) {
     ev.keycode = scancodeFromLParam(lparam);
     ev.composing = false;
 
-    // Translate the key to its produced text (Enter -> \r, etc.). Only on key
-    // down; ToUnicode also advances dead-key state.
     char utf8[16] = {0};
     if (down) {
         BYTE kb[256];
@@ -372,126 +500,221 @@ void handleKey(Host* host, UINT msg, WPARAM wparam, LPARAM lparam) {
     }
     ev.text = utf8;
 
-    // Unshifted codepoint, used for keybinding matching.
     uint32_t cp = MapVirtualKeyW(static_cast<UINT>(wparam), MAPVK_VK_TO_CHAR) & 0x7FFFFFFFu;
     if (cp >= 'A' && cp <= 'Z')
         cp += 32;
     ev.unshifted_codepoint = cp;
 
-    ghostty_surface_key(host->surface, ev);
+    ghostty_surface_key(s->surface, ev);
 }
 
-void handleMouseButton(Host* host, ghostty_input_mouse_state_e state,
+void handleMouseButton(Surface* s, ghostty_input_mouse_state_e state,
                        ghostty_input_mouse_button_e button) {
-    if (host->surface == nullptr)
+    if (s->surface == nullptr)
         return;
     if (state == GHOSTTY_MOUSE_PRESS) {
-        SetCapture(host->hwnd);
+        SetCapture(s->hwnd);
     } else {
         ReleaseCapture();
     }
-    ghostty_surface_mouse_button(host->surface, state, button, currentMods());
+    ghostty_surface_mouse_button(s->surface, state, button, currentMods());
 }
 
-LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
-    Host* host = &g_host;
-    switch (msg) {
-    case WM_GHOSTTY_WAKEUP:
-        if (host->app != nullptr)
-            ghostty_app_tick(host->app);
-        return 0;
+LRESULT CALLBACK surfaceWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    if (msg == WM_NCCREATE) {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lparam);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
 
+    auto* s = reinterpret_cast<Surface*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (s == nullptr)
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+
+    switch (msg) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
         BeginPaint(hwnd, &ps);
-        if (host->surface != nullptr)
-            ghostty_surface_draw(host->surface);
+        if (s->surface != nullptr)
+            ghostty_surface_draw(s->surface);
         EndPaint(hwnd, &ps);
         return 0;
     }
 
     case WM_SIZE:
-        if (host->surface != nullptr) {
-            ghostty_surface_set_size(host->surface, LOWORD(lparam), HIWORD(lparam));
+        if (s->surface != nullptr) {
+            ghostty_surface_set_size(s->surface, LOWORD(lparam), HIWORD(lparam));
         }
         return 0;
-
-    case WM_DPICHANGED: {
-        if (host->surface != nullptr) {
-            const double scale = dpiScale(hwnd);
-            ghostty_surface_set_content_scale(host->surface, scale, scale);
-        }
-        const RECT* r = reinterpret_cast<const RECT*>(lparam);
-        SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
-        return 0;
-    }
 
     case WM_SETFOCUS:
-        if (host->surface != nullptr)
-            ghostty_surface_set_focus(host->surface, true);
+        if (s->surface != nullptr)
+            ghostty_surface_set_focus(s->surface, true);
         return 0;
 
     case WM_KILLFOCUS:
-        if (host->surface != nullptr)
-            ghostty_surface_set_focus(host->surface, false);
+        if (s->surface != nullptr)
+            ghostty_surface_set_focus(s->surface, false);
         return 0;
+
+    case WM_SETCURSOR:
+        if (LOWORD(lparam) == HTCLIENT) {
+            SetCursor(s->cursor_visible ? s->cursor : nullptr);
+            return TRUE;
+        }
+        break;
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
     case WM_KEYUP:
     case WM_SYSKEYUP:
-        handleKey(host, msg, wparam, lparam);
+        handleKey(s, msg, wparam, lparam);
         return 0;
 
-    case WM_SETCURSOR:
-        // Apply our tracked cursor over the client area; let the system
-        // handle borders/resize edges.
-        if (LOWORD(lparam) == HTCLIENT) {
-            SetCursor(host->cursor_visible ? host->cursor : nullptr);
-            return TRUE;
-        }
-        break;
-
     case WM_MOUSEMOVE:
-        if (host->surface != nullptr) {
-            ghostty_surface_mouse_pos(host->surface, static_cast<double>(GET_X_LPARAM(lparam)),
+        if (s->surface != nullptr) {
+            ghostty_surface_mouse_pos(s->surface, static_cast<double>(GET_X_LPARAM(lparam)),
                                       static_cast<double>(GET_Y_LPARAM(lparam)), currentMods());
         }
         return 0;
 
     case WM_LBUTTONDOWN:
-        handleMouseButton(host, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT);
+        handleMouseButton(s, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT);
         return 0;
     case WM_LBUTTONUP:
-        handleMouseButton(host, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT);
+        handleMouseButton(s, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_LEFT);
         return 0;
     case WM_RBUTTONDOWN:
-        handleMouseButton(host, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_RIGHT);
+        handleMouseButton(s, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_RIGHT);
         return 0;
     case WM_RBUTTONUP:
-        handleMouseButton(host, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_RIGHT);
+        handleMouseButton(s, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_RIGHT);
         return 0;
     case WM_MBUTTONDOWN:
-        handleMouseButton(host, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_MIDDLE);
+        handleMouseButton(s, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_MIDDLE);
         return 0;
     case WM_MBUTTONUP:
-        handleMouseButton(host, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_MIDDLE);
+        handleMouseButton(s, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_MIDDLE);
         return 0;
 
     case WM_MOUSEWHEEL:
-        if (host->surface != nullptr) {
-            const double delta = static_cast<double>(GET_WHEEL_DELTA_WPARAM(wparam)) / WHEEL_DELTA;
-            ghostty_surface_mouse_scroll(host->surface, 0.0, delta, 0);
+        if (s->surface != nullptr) {
+            ghostty_surface_mouse_scroll(
+                s->surface, 0.0, static_cast<double>(GET_WHEEL_DELTA_WPARAM(wparam)) / WHEEL_DELTA,
+                0);
+        }
+        return 0;
+    case WM_MOUSEHWHEEL:
+        if (s->surface != nullptr) {
+            ghostty_surface_mouse_scroll(
+                s->surface, static_cast<double>(GET_WHEEL_DELTA_WPARAM(wparam)) / WHEEL_DELTA, 0.0,
+                0);
         }
         return 0;
 
-    case WM_MOUSEHWHEEL:
-        if (host->surface != nullptr) {
-            const double delta = static_cast<double>(GET_WHEEL_DELTA_WPARAM(wparam)) / WHEEL_DELTA;
-            ghostty_surface_mouse_scroll(host->surface, delta, 0.0, 0);
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+Surface* createSurface(App* app) {
+    auto* s = new Surface();
+    s->cursor = LoadCursorW(nullptr, IDC_IBEAM);
+    s->hwnd = CreateWindowExW(0, kSurfaceClass, L"", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 0, 0,
+                              app->hwnd, nullptr, GetModuleHandleW(nullptr), s);
+    if (s->hwnd == nullptr) {
+        delete s;
+        return nullptr;
+    }
+
+    ghostty_surface_config_s config = ghostty_surface_config_new();
+    config.platform_tag = GHOSTTY_PLATFORM_WINDOWS;
+    config.platform.windows.hwnd = s->hwnd;
+    config.userdata = s;
+    config.scale_factor = dpiScale(s->hwnd);
+    s->surface = ghostty_surface_new(app->app, &config);
+    if (s->surface == nullptr) {
+        DestroyWindow(s->hwnd);
+        delete s;
+        return nullptr;
+    }
+    return s;
+}
+
+//----------------------------------------------------------------------------//
+// Top-level window
+//----------------------------------------------------------------------------//
+
+// Draw the tab strip across the top of the window.
+void paintTabBar(App* app, HDC dc) {
+    RECT client;
+    GetClientRect(app->hwnd, &client);
+    const int bar = tabBarHeight(app->hwnd);
+    const int n = static_cast<int>(app->tabs.size());
+    if (n == 0)
+        return;
+
+    RECT strip = {client.left, client.top, client.right, client.top + bar};
+    FillRect(dc, &strip, reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1));
+
+    const int width = (client.right - client.left) / n;
+    SetBkMode(dc, TRANSPARENT);
+    for (int i = 0; i < n; i++) {
+        RECT tab = {client.left + i * width, client.top,
+                    (i == n - 1) ? client.right : client.left + (i + 1) * width, client.top + bar};
+        FillRect(dc, &tab,
+                 reinterpret_cast<HBRUSH>(
+                     (static_cast<size_t>(i) == app->active ? COLOR_WINDOW : COLOR_BTNFACE) + 1));
+        FrameRect(dc, &tab, reinterpret_cast<HBRUSH>(COLOR_BTNSHADOW + 1));
+        const std::string& title = app->tabs[static_cast<size_t>(i)]->title;
+        const std::string label = title.empty() ? "Ghostty" : title;
+        RECT text = tab;
+        text.left += 8;
+        DrawTextA(dc, label.c_str(), -1, &text,
+                  DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
+}
+
+LRESULT CALLBACK appWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    App* app = &g_app;
+    switch (msg) {
+    case WM_GHOSTTY_WAKEUP:
+        if (app->app != nullptr)
+            ghostty_app_tick(app->app);
+        return 0;
+
+    case WM_SIZE:
+        layoutTabs(app);
+        return 0;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        paintTabBar(app, dc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN: {
+        const int y = GET_Y_LPARAM(lparam);
+        const int n = static_cast<int>(app->tabs.size());
+        if (y < tabBarHeight(hwnd) && n > 0) {
+            RECT client;
+            GetClientRect(hwnd, &client);
+            const int width = (client.right - client.left) / n;
+            const int idx = (width > 0) ? GET_X_LPARAM(lparam) / width : 0;
+            setActiveTab(app, static_cast<size_t>(idx < n ? idx : n - 1));
         }
         return 0;
+    }
+
+    case WM_SETFOCUS: {
+        Surface* s = activeSurface(app);
+        if (s != nullptr)
+            SetFocus(s->hwnd);
+        return 0;
+    }
 
     case WM_CLOSE:
     case WM_DESTROY:
@@ -514,13 +737,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         return 1;
     }
 
-    // Build the configuration from the user's default config files.
     ghostty_config_t config = ghostty_config_new();
     ghostty_config_load_default_files(config);
     ghostty_config_finalize(config);
 
     ghostty_runtime_config_s runtime = {};
-    runtime.userdata = &g_host;
+    runtime.userdata = &g_app;
     runtime.supports_selection_clipboard = false;
     runtime.wakeup_cb = wakeupCb;
     runtime.action_cb = actionCb;
@@ -529,56 +751,46 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     runtime.write_clipboard_cb = writeClipboardCb;
     runtime.close_surface_cb = closeSurfaceCb;
 
-    g_host.app = ghostty_app_new(&runtime, config);
+    g_app.app = ghostty_app_new(&runtime, config);
     ghostty_config_free(config);
-    if (g_host.app == nullptr) {
+    if (g_app.app == nullptr) {
         MessageBoxW(nullptr, L"ghostty_app_new failed", L"Ghostty", MB_ICONERROR);
         return 1;
     }
 
-    const wchar_t* class_name = L"GhosttyWindow";
-    WNDCLASSEXW wc = {};
-    wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = wndProc;
-    wc.hInstance = hInstance;
-    wc.hCursor = LoadCursor(nullptr, IDC_IBEAM);
-    wc.lpszClassName = class_name;
-    RegisterClassExW(&wc);
+    WNDCLASSEXW surface_class = {};
+    surface_class.cbSize = sizeof(surface_class);
+    surface_class.style = CS_HREDRAW | CS_VREDRAW;
+    surface_class.lpfnWndProc = surfaceWndProc;
+    surface_class.hInstance = hInstance;
+    surface_class.lpszClassName = kSurfaceClass;
+    RegisterClassExW(&surface_class);
 
-    g_host.cursor = LoadCursorW(nullptr, IDC_IBEAM);
+    WNDCLASSEXW window_class = {};
+    window_class.cbSize = sizeof(window_class);
+    window_class.style = CS_HREDRAW | CS_VREDRAW;
+    window_class.lpfnWndProc = appWndProc;
+    window_class.hInstance = hInstance;
+    window_class.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    window_class.lpszClassName = kWindowClass;
+    RegisterClassExW(&window_class);
 
-    g_host.hwnd = CreateWindowExW(0, class_name, L"Ghostty", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
-                                  CW_USEDEFAULT, 800, 600, nullptr, nullptr, hInstance, nullptr);
-    if (g_host.hwnd == nullptr) {
+    g_app.hwnd = CreateWindowExW(0, kWindowClass, L"Ghostty", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
+                                 CW_USEDEFAULT, 800, 600, nullptr, nullptr, hInstance, nullptr);
+    if (g_app.hwnd == nullptr) {
         MessageBoxW(nullptr, L"CreateWindow failed", L"Ghostty", MB_ICONERROR);
         return 1;
     }
 
-    // Create the terminal surface bound to our window.
-    ghostty_surface_config_s surface_config = ghostty_surface_config_new();
-    surface_config.platform_tag = GHOSTTY_PLATFORM_WINDOWS;
-    surface_config.platform.windows.hwnd = g_host.hwnd;
-    surface_config.userdata = &g_host;
-    surface_config.scale_factor = dpiScale(g_host.hwnd);
-    g_host.surface = ghostty_surface_new(g_host.app, &surface_config);
-    if (g_host.surface == nullptr) {
+    addTab(&g_app);
+    if (g_app.tabs.empty()) {
         MessageBoxW(nullptr, L"ghostty_surface_new failed", L"Ghostty", MB_ICONERROR);
         return 1;
     }
 
-    // Push the initial size and focus, then show the window.
-    RECT client;
-    GetClientRect(g_host.hwnd, &client);
-    ghostty_surface_set_size(g_host.surface, client.right - client.left,
-                             client.bottom - client.top);
-    ghostty_surface_set_focus(g_host.surface, true);
-
-    ShowWindow(g_host.hwnd, nCmdShow);
-    UpdateWindow(g_host.hwnd);
-
-    // Process any events queued during startup.
-    ghostty_app_tick(g_host.app);
+    ShowWindow(g_app.hwnd, nCmdShow);
+    UpdateWindow(g_app.hwnd);
+    ghostty_app_tick(g_app.app);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -586,7 +798,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
         DispatchMessageW(&msg);
     }
 
-    ghostty_surface_free(g_host.surface);
-    ghostty_app_free(g_host.app);
+    for (Surface* s : g_app.tabs) {
+        ghostty_surface_free(s->surface);
+        delete s;
+    }
+    ghostty_app_free(g_app.app);
     return static_cast<int>(msg.wParam);
 }
