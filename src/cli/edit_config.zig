@@ -76,20 +76,6 @@ fn runInner(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
     const path = try configpkg.preferredDefaultFilePath(alloc);
     defer alloc.free(path);
 
-    // We don't currently support Windows because we use the exec syscall.
-    if (comptime builtin.os.tag == .windows) {
-        try stderr.print(
-            \\The `ghostty +edit-config` command is not supported on Windows.
-            \\Please edit the configuration file manually at the following path:
-            \\
-            \\{s}
-            \\
-        ,
-            .{path},
-        );
-        return 1;
-    }
-
     // Get our editor
     const get_env_: ?internal_os.GetEnvResult = env: {
         // VISUAL vs. EDITOR: https://unix.stackexchange.com/questions/4859/visual-vs-editor-what-s-the-difference
@@ -107,6 +93,12 @@ fn runInner(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
     };
     defer if (get_env_) |v| v.deinit(alloc);
     const editor: []const u8 = if (get_env_) |v| v.value else "";
+
+    // Windows has no exec syscall, so we spawn a child process and wait for
+    // it instead of replacing ourselves with the editor.
+    if (comptime builtin.os.tag == .windows) {
+        return runWindows(alloc, stderr, editor, path);
+    }
 
     // If we don't have `$EDITOR` set then we can't do anything
     // but we can still print a helpful message.
@@ -177,4 +169,50 @@ fn runInner(alloc: Allocator, stderr: *std.Io.Writer) !u8 {
         \\
     , .{ err, editor, path });
     return 1;
+}
+
+/// Open the configuration file on Windows. Unlike POSIX, we can't `exec`, so
+/// we spawn a child process and wait for it. If `$VISUAL`/`$EDITOR` is set we
+/// run it (honoring simple arguments such as `code --wait`); otherwise we open
+/// the file with its associated program via the shell's `start` builtin.
+fn runWindows(
+    alloc: Allocator,
+    stderr: *std.Io.Writer,
+    editor: []const u8,
+    path: []const u8,
+) !u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(alloc);
+
+    if (editor.len > 0) {
+        // Split on spaces so a configured editor can carry arguments. An
+        // editor whose own path contains spaces is an uncommon case we don't
+        // handle here.
+        var it = std.mem.tokenizeScalar(u8, editor, ' ');
+        while (it.next()) |part| try argv.append(alloc, part);
+        try argv.append(alloc, path);
+    } else {
+        // No $EDITOR/$VISUAL is set, which is common on Windows. Open the file
+        // with its associated program. The empty string is `start`'s window
+        // title argument, which is required when the path is quoted.
+        try argv.appendSlice(alloc, &.{ "cmd", "/c", "start", "", path });
+    }
+
+    var child: std.process.Child = .init(argv.items, alloc);
+    const term = child.spawnAndWait() catch |err| {
+        try stderr.print(
+            \\Failed to open the editor. Error={}.
+            \\
+            \\You can edit the configuration file manually at the following path:
+            \\
+            \\{s}
+            \\
+        , .{ err, path });
+        return 1;
+    };
+
+    return switch (term) {
+        .Exited => |code| code,
+        else => 1,
+    };
 }
