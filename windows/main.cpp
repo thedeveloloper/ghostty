@@ -529,15 +529,66 @@ void toggleFullscreen(App* app) {
     }
 }
 
+// Convert a UTF-8 string to a wide string. A negative len treats the input as
+// null-terminated; otherwise it is the byte length.
+std::wstring utf8ToWide(const char* s, int len) {
+    if (s == nullptr)
+        return {};
+    const int wn = MultiByteToWideChar(CP_UTF8, 0, s, len, nullptr, 0);
+    if (wn <= 0)
+        return {};
+    std::wstring wide(static_cast<size_t>(wn), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s, len, wide.data(), wn);
+    // A null-terminated input includes the terminator in the count; drop it.
+    if (len < 0 && !wide.empty() && wide.back() == L'\0')
+        wide.pop_back();
+    return wide;
+}
+
 void openUrl(const char* url, uintptr_t len) {
     if (url == nullptr || len == 0)
         return;
-    const int wn = MultiByteToWideChar(CP_UTF8, 0, url, static_cast<int>(len), nullptr, 0);
-    if (wn <= 0)
+    const std::wstring wide = utf8ToWide(url, static_cast<int>(len));
+    if (wide.empty())
         return;
-    std::wstring wide(static_cast<size_t>(wn), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, url, static_cast<int>(len), wide.data(), wn);
     ShellExecuteW(nullptr, L"open", wide.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+// Open the configuration file, creating it if needed. Triggered by the
+// OPEN_CONFIG action. Opens it with the file's associated program, falling
+// back to Notepad when the configuration file type has no association.
+void openConfig() {
+    const ghostty_string_s path = ghostty_config_open_path();
+    if (path.ptr == nullptr || path.len == 0)
+        return;
+    const std::wstring wide = utf8ToWide(path.ptr, static_cast<int>(path.len));
+    ghostty_string_free(path);
+    if (wide.empty())
+        return;
+
+    const HINSTANCE rc =
+        ShellExecuteW(nullptr, L"open", wide.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    if (reinterpret_cast<INT_PTR>(rc) <= 32) {
+        std::wstring cmd = L"notepad.exe \"" + wide + L"\"";
+        STARTUPINFOW si = {sizeof(si)};
+        PROCESS_INFORMATION pi = {};
+        if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si,
+                           &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+    }
+}
+
+// Reload configuration from disk and propagate it to the app and all surfaces.
+// Mirrors the initial load in wWinMain. update_config does not take ownership,
+// so we free our copy afterward.
+void reloadConfig(App* app) {
+    ghostty_config_t config = ghostty_config_new();
+    ghostty_config_load_default_files(config);
+    ghostty_config_finalize(config);
+    ghostty_app_update_config(app->app, config);
+    ghostty_config_free(config);
 }
 
 //----------------------------------------------------------------------------//
@@ -699,6 +750,20 @@ bool actionCb(ghostty_app_t app_handle, ghostty_target_s target, ghostty_action_
 
     case GHOSTTY_ACTION_OPEN_URL:
         openUrl(action.action.open_url.url, action.action.open_url.len);
+        return true;
+
+    case GHOSTTY_ACTION_OPEN_CONFIG:
+        openConfig();
+        return true;
+
+    case GHOSTTY_ACTION_RELOAD_CONFIG:
+        reloadConfig(app);
+        return true;
+
+    case GHOSTTY_ACTION_CONFIG_CHANGE:
+        // The configuration changed; repaint so any visual changes take
+        // effect. The core propagates the new config to surfaces itself.
+        InvalidateRect(app->hwnd, nullptr, FALSE);
         return true;
 
     case GHOSTTY_ACTION_QUIT:
