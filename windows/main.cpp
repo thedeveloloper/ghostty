@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "ghostty.h"
@@ -592,6 +593,347 @@ void reloadConfig(App* app) {
 }
 
 //----------------------------------------------------------------------------//
+// Settings window
+//----------------------------------------------------------------------------//
+//
+// A small native window exposing a few common settings plus shortcuts to the
+// configuration file. Ghostty's configuration is a text file with hundreds of
+// options, so this is intentionally a curated subset; the full set is edited
+// in the file itself ("Open File"). Changes are written back to the config
+// file and applied via reloadConfig.
+
+// Custom WM_SYSCOMMAND id for the "Settings" system-menu entry. Must be below
+// 0xF000 (reserved for system commands) and a multiple of 16.
+constexpr UINT SC_GHOSTTY_SETTINGS = 0x0020;
+const wchar_t* kSettingsClass = L"GhosttySettings";
+
+enum SettingsControl : int {
+    kCfgPath = 1001,
+    kOpenFile,
+    kOpenFolder,
+    kFontFamily,
+    kFontSize,
+    kTheme,
+    kBgOpacity,
+    kCursorStyle,
+    kSave,
+    kCloseBtn,
+};
+
+// The settings window is a singleton; null when closed.
+HWND g_settings_hwnd = nullptr;
+HFONT g_settings_font = nullptr;
+
+std::string readFileUtf8(const std::wstring& path) {
+    std::string out;
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    if (f == nullptr)
+        return out;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        out.append(buf, n);
+    fclose(f);
+    return out;
+}
+
+bool writeFileUtf8(const std::wstring& path, const std::string& content) {
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    if (f == nullptr)
+        return false;
+    const size_t n = content.empty() ? 0 : fwrite(content.data(), 1, content.size(), f);
+    fclose(f);
+    return n == content.size();
+}
+
+std::string trimConfig(const std::string& s) {
+    const size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos)
+        return "";
+    const size_t b = s.find_last_not_of(" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+// Split content into lines, dropping a trailing carriage return from each.
+std::vector<std::string> splitLines(const std::string& content) {
+    std::vector<std::string> lines;
+    std::string cur;
+    for (const char c : content) {
+        if (c == '\n') {
+            if (!cur.empty() && cur.back() == '\r')
+                cur.pop_back();
+            lines.push_back(cur);
+            cur.clear();
+        } else {
+            cur.push_back(c);
+        }
+    }
+    if (!cur.empty()) {
+        if (cur.back() == '\r')
+            cur.pop_back();
+        lines.push_back(cur);
+    }
+    return lines;
+}
+
+// Parse `key = value` from a config line, ignoring comments and blanks.
+bool parseConfigLine(const std::string& line, std::string& key, std::string& value) {
+    const std::string t = trimConfig(line);
+    if (t.empty() || t[0] == '#')
+        return false;
+    const size_t eq = t.find('=');
+    if (eq == std::string::npos)
+        return false;
+    key = trimConfig(t.substr(0, eq));
+    value = trimConfig(t.substr(eq + 1));
+    return !key.empty();
+}
+
+// The last assignment of a key wins, matching the core's parsing.
+std::string getConfigValue(const std::vector<std::string>& lines, const std::string& key) {
+    std::string value;
+    for (const std::string& line : lines) {
+        std::string k, v;
+        if (parseConfigLine(line, k, v) && k == key)
+            value = v;
+    }
+    return value;
+}
+
+// Update the given keys in the config file: replace each key's last assignment
+// or append it when absent. Keys with an empty value are left untouched.
+bool setConfigValues(const std::wstring& path,
+                     const std::vector<std::pair<std::string, std::string>>& kv) {
+    std::vector<std::string> lines = splitLines(readFileUtf8(path));
+    for (const auto& [key, value] : kv) {
+        if (value.empty())
+            continue;
+        const std::string entry = key + " = " + value;
+        int last = -1;
+        for (int i = 0; i < static_cast<int>(lines.size()); i++) {
+            std::string k, v;
+            if (parseConfigLine(lines[i], k, v) && k == key)
+                last = i;
+        }
+        if (last >= 0)
+            lines[static_cast<size_t>(last)] = entry;
+        else
+            lines.push_back(entry);
+    }
+    std::string out;
+    for (const std::string& line : lines)
+        out += line + "\r\n";
+    return writeFileUtf8(path, out);
+}
+
+void setControlTextUtf8(HWND hwnd, int id, const std::string& utf8) {
+    SetDlgItemTextW(hwnd, id, utf8ToWide(utf8.c_str(), -1).c_str());
+}
+
+std::string getControlTextUtf8(HWND hwnd, int id) {
+    HWND ctl = GetDlgItem(hwnd, id);
+    const int len = GetWindowTextLengthW(ctl);
+    if (len <= 0)
+        return "";
+    std::wstring w(static_cast<size_t>(len) + 1, L'\0');
+    GetWindowTextW(ctl, w.data(), len + 1);
+    w.resize(static_cast<size_t>(len));
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 0)
+        return "";
+    std::string out(static_cast<size_t>(n - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+LRESULT CALLBACK settingsWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    switch (msg) {
+    case WM_CREATE: {
+        const HINSTANCE inst = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd, GWLP_HINSTANCE));
+        const UINT dpi = GetDpiForWindow(hwnd);
+        const auto px = [dpi](int v) { return MulDiv(v, static_cast<int>(dpi), 96); };
+
+        g_settings_font =
+            CreateFontW(-MulDiv(9, static_cast<int>(dpi), 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE,
+                        FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+
+        // Create a child control and apply the shared font.
+        const int label_w = px(120), ctl_x = px(140), ctl_w = px(290);
+        int y = px(12);
+        auto row = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int id, int h) {
+            HWND c = CreateWindowExW(0, cls, text, WS_CHILD | WS_VISIBLE | style, ctl_x, y, ctl_w,
+                                     h, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                                     inst, nullptr);
+            if (c != nullptr)
+                SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(g_settings_font), TRUE);
+            return c;
+        };
+        auto label = [&](const wchar_t* text) {
+            HWND c = CreateWindowExW(0, L"STATIC", text, WS_CHILD | WS_VISIBLE, px(12), y + px(3),
+                                     label_w, px(20), hwnd, nullptr, inst, nullptr);
+            if (c != nullptr)
+                SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(g_settings_font), TRUE);
+        };
+
+        label(L"Config file:");
+        row(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | ES_READONLY, kCfgPath, px(22));
+        y += px(30);
+        CreateWindowExW(0, L"BUTTON", L"Open File", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, ctl_x, y,
+                        px(110), px(26), hwnd,
+                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kOpenFile)), inst, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"Open Folder", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                        ctl_x + px(120), y, px(110), px(26), hwnd,
+                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kOpenFolder)), inst, nullptr);
+        for (int id : {kOpenFile, kOpenFolder})
+            SendMessageW(GetDlgItem(hwnd, id), WM_SETFONT,
+                         reinterpret_cast<WPARAM>(g_settings_font), TRUE);
+        y += px(40);
+
+        label(L"Font family:");
+        row(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, kFontFamily, px(22));
+        y += px(30);
+        label(L"Font size:");
+        row(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, kFontSize, px(22));
+        y += px(30);
+        label(L"Theme:");
+        row(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, kTheme, px(22));
+        y += px(30);
+        label(L"Background opacity:");
+        row(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL, kBgOpacity, px(22));
+        y += px(30);
+        label(L"Cursor style:");
+        HWND combo =
+            row(L"COMBOBOX", L"", WS_BORDER | CBS_DROPDOWNLIST | WS_VSCROLL, kCursorStyle, px(120));
+        for (const wchar_t* item : {L"block", L"bar", L"underline", L"block_hollow"})
+            SendMessageW(combo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+        y += px(40);
+
+        CreateWindowExW(0, L"BUTTON", L"Save && Reload", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                        ctl_x, y, px(140), px(28), hwnd,
+                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kSave)), inst, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"Close", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                        ctl_x + px(150), y, px(100), px(28), hwnd,
+                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCloseBtn)), inst, nullptr);
+        for (int id : {kSave, kCloseBtn})
+            SendMessageW(GetDlgItem(hwnd, id), WM_SETFONT,
+                         reinterpret_cast<WPARAM>(g_settings_font), TRUE);
+
+        // Resolve the config path (creating the file if needed) and prefill.
+        const ghostty_string_s p = ghostty_config_open_path();
+        auto* path = new std::wstring(utf8ToWide(p.ptr, static_cast<int>(p.len)));
+        ghostty_string_free(p);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(path));
+        SetDlgItemTextW(hwnd, kCfgPath, path->c_str());
+
+        const std::vector<std::string> lines = splitLines(readFileUtf8(*path));
+        setControlTextUtf8(hwnd, kFontFamily, getConfigValue(lines, "font-family"));
+        setControlTextUtf8(hwnd, kFontSize, getConfigValue(lines, "font-size"));
+        setControlTextUtf8(hwnd, kTheme, getConfigValue(lines, "theme"));
+        setControlTextUtf8(hwnd, kBgOpacity, getConfigValue(lines, "background-opacity"));
+        const std::wstring cs = utf8ToWide(getConfigValue(lines, "cursor-style").c_str(), -1);
+        if (!cs.empty())
+            SendMessageW(combo, CB_SELECTSTRING, static_cast<WPARAM>(-1),
+                         reinterpret_cast<LPARAM>(cs.c_str()));
+        return 0;
+    }
+
+    case WM_CTLCOLORSTATIC:
+        SetBkMode(reinterpret_cast<HDC>(wparam), TRANSPARENT);
+        return reinterpret_cast<LRESULT>(GetSysColorBrush(COLOR_BTNFACE));
+
+    case WM_COMMAND:
+        switch (LOWORD(wparam)) {
+        case kOpenFile:
+            openConfig();
+            return 0;
+        case kOpenFolder: {
+            auto* path = reinterpret_cast<std::wstring*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            if (path != nullptr) {
+                const size_t slash = path->find_last_of(L"\\/");
+                if (slash != std::wstring::npos)
+                    ShellExecuteW(nullptr, L"open", path->substr(0, slash).c_str(), nullptr,
+                                  nullptr, SW_SHOWNORMAL);
+            }
+            return 0;
+        }
+        case kSave: {
+            auto* path = reinterpret_cast<std::wstring*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+            if (path != nullptr) {
+                setConfigValues(*path,
+                                {
+                                    {"font-family", getControlTextUtf8(hwnd, kFontFamily)},
+                                    {"font-size", getControlTextUtf8(hwnd, kFontSize)},
+                                    {"theme", getControlTextUtf8(hwnd, kTheme)},
+                                    {"background-opacity", getControlTextUtf8(hwnd, kBgOpacity)},
+                                    {"cursor-style", getControlTextUtf8(hwnd, kCursorStyle)},
+                                });
+            }
+            reloadConfig(&g_app);
+            return 0;
+        }
+        case kCloseBtn:
+            DestroyWindow(hwnd);
+            return 0;
+        default:
+            break;
+        }
+        break;
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_NCDESTROY: {
+        delete reinterpret_cast<std::wstring*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        if (g_settings_font != nullptr) {
+            DeleteObject(g_settings_font);
+            g_settings_font = nullptr;
+        }
+        g_settings_hwnd = nullptr;
+        return 0;
+    }
+
+    default:
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+// Open the settings window, focusing the existing one if already open.
+void openSettings(App* app) {
+    if (g_settings_hwnd != nullptr) {
+        SetForegroundWindow(g_settings_hwnd);
+        return;
+    }
+
+    const HINSTANCE inst =
+        reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(app->hwnd, GWLP_HINSTANCE));
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW c = {};
+        c.cbSize = sizeof(c);
+        c.lpfnWndProc = settingsWndProc;
+        c.hInstance = inst;
+        c.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        c.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        c.lpszClassName = kSettingsClass;
+        RegisterClassExW(&c);
+        registered = true;
+    }
+
+    const double s = dpiScale(app->hwnd);
+    g_settings_hwnd = CreateWindowExW(0, kSettingsClass, L"Ghostty Settings",
+                                      WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT,
+                                      CW_USEDEFAULT, static_cast<int>(470 * s),
+                                      static_cast<int>(380 * s), app->hwnd, nullptr, inst, nullptr);
+    if (g_settings_hwnd != nullptr) {
+        ShowWindow(g_settings_hwnd, SW_SHOW);
+        UpdateWindow(g_settings_hwnd);
+    }
+}
+
+//----------------------------------------------------------------------------//
 // libghostty runtime callbacks
 //----------------------------------------------------------------------------//
 
@@ -1073,6 +1415,13 @@ LRESULT CALLBACK appWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             ghostty_app_tick(app->app);
         return 0;
 
+    case WM_SYSCOMMAND:
+        if ((wparam & 0xFFF0) == SC_GHOSTTY_SETTINGS) {
+            openSettings(app);
+            return 0;
+        }
+        break;
+
     case WM_SIZE:
         layoutTabs(app);
         return 0;
@@ -1243,6 +1592,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
     if (g_app.hwnd == nullptr) {
         MessageBoxW(nullptr, L"CreateWindow failed", L"Ghostty", MB_ICONERROR);
         return 1;
+    }
+
+    // Add a "Settings" entry to the window's system menu (Alt+Space). This
+    // avoids stealing keyboard shortcuts that belong to the terminal.
+    if (HMENU sysmenu = GetSystemMenu(g_app.hwnd, FALSE)) {
+        AppendMenuW(sysmenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(sysmenu, MF_STRING, SC_GHOSTTY_SETTINGS, L"Settings…");
     }
 
     addTab(&g_app);
